@@ -2,7 +2,7 @@
 """
 Fast Local Arbitrage Bot with Web UI
 25-100ms configurable polling - Local Demo Mode
-Enhanced Performance & UX
+Enhanced Performance  & UX
 """
 
 import asyncio
