@@ -986,15 +986,31 @@ def toggle_pause():
     return jsonify({'error': 'Bot not running'}), 500
 
 
+def get_local_ip():
+    """Get the local IP address for network access"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "localhost"
+
+
 def run_flask():
     import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
-    app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False, threaded=True)
+    # Bind to 0.0.0.0 to allow access from other devices on the network
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
 
 
 def main():
     global bot_instance
+
+    local_ip = get_local_ip()
 
     print("""
 ╔════════════════════════════════════════════════════════════════╗
@@ -1003,7 +1019,6 @@ def main():
 ║                                                                ║
 ║   Mode: LOCAL (no external APIs)                               ║
 ║   Polling: 25-100ms configurable                               ║
-║   Dashboard: http://localhost:5000                             ║
 ║                                                                ║
 ║   Features: Sparklines, Sound alerts, Pause/Resume,            ║
 ║             Speed control, Best trade tracking                 ║
@@ -1015,7 +1030,10 @@ def main():
     flask_thread.start()
 
     time.sleep(0.5)
-    print("🌐 Dashboard ready at http://localhost:5000\n")
+    print("🌐 Dashboard ready!")
+    print(f"   Local:   http://localhost:5000")
+    print(f"   Network: http://{local_ip}:5000  ← Use this on iPhone")
+    print()
 
     bot_instance = FastArbitrageBot()
 
