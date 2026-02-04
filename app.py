@@ -62,7 +62,14 @@ class Config:
     # Strategy toggles
     ENABLE_SINGLE_CONDITION: bool = True
     ENABLE_MULTI_OUTCOME: bool = True  # Similar to NegRisk for multi-outcome markets
-    ENABLE_WHALE_TRACKING: bool = False  # Requires more API calls
+    ENABLE_WHALE_TRACKING: bool = True  # Track large trades
+
+    # Whale tracking settings
+    WHALE_THRESHOLD: float = float(os.getenv("WHALE_THRESHOLD", "5000"))  # $5K minimum
+    WHALE_LOOKBACK_TRADES: int = 50  # Recent trades to analyze
+
+    # Parallel request settings
+    MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 
     # Mode
     DEMO_MODE: bool = os.getenv("DEMO_MODE", "true").lower() == "true"
@@ -195,6 +202,59 @@ class KalshiClient:
             logger.error(f"Error fetching events: {e}")
             return []
 
+    async def get_event_markets(self, event_ticker: str) -> List[Dict]:
+        """Fetch all markets for a specific event (for NegRisk detection)"""
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/markets"
+            params = {"event_ticker": event_ticker, "limit": 100}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("markets", [])
+                return []
+        except Exception as e:
+            logger.error(f"Error fetching event markets {event_ticker}: {e}")
+            return []
+
+    async def get_trades(self, ticker: str, limit: int = 100) -> List[Dict]:
+        """Fetch recent trades for whale tracking"""
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/markets/{ticker}/trades"
+            params = {"limit": limit}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("trades", [])
+                return []
+        except Exception as e:
+            logger.error(f"Error fetching trades {ticker}: {e}")
+            return []
+
+    async def get_orderbooks_batch(self, tickers: List[str], max_concurrent: int = 10) -> Dict[str, Dict]:
+        """Fetch multiple orderbooks concurrently for speed"""
+        import asyncio
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def fetch_one(ticker: str) -> tuple:
+            async with semaphore:
+                ob = await self.get_orderbook(ticker)
+                return ticker, ob
+
+        results = await asyncio.gather(*[fetch_one(t) for t in tickers], return_exceptions=True)
+
+        orderbooks = {}
+        for result in results:
+            if isinstance(result, tuple):
+                ticker, ob = result
+                if ob:
+                    orderbooks[ticker] = ob
+        return orderbooks
+
 
 # =============================================================================
 # COINBASE API CLIENT
@@ -280,7 +340,7 @@ class ArbitrageOpportunity:
     """Represents a detected arbitrage opportunity"""
     market_id: str
     market_title: str
-    strategy: str  # "single_condition" or "multi_outcome"
+    strategy: str  # "single_condition", "multi_outcome", or "whale_signal"
     yes_price: float
     no_price: float
     total_price: float
@@ -291,6 +351,19 @@ class ArbitrageOpportunity:
     urgency: str  # "high", "medium", "low"
     timestamp: float
     details: Dict[str, Any]
+
+
+@dataclass
+class WhaleSignal:
+    """Represents a whale trading signal"""
+    market_id: str
+    market_title: str
+    direction: str  # "YES" or "NO"
+    total_volume: float
+    trade_count: int
+    avg_price: float
+    confidence: float  # 0-1 based on consistency
+    timestamp: float
 
 
 class ArbitrageDetector:
@@ -502,6 +575,112 @@ class ArbitrageDetector:
         self.seen_opportunities[key] = now
         return False
 
+    def detect_whale_activity(self, market: Dict, trades: List[Dict]) -> Optional[WhaleSignal]:
+        """
+        Detect whale trading activity - large trades indicating informed traders
+        IMDEA research: 61-68% accuracy predicting price movement within T+15 to T+60 min
+        """
+        if not trades:
+            return None
+
+        try:
+            ticker = market.get("ticker", "")
+            title = market.get("title", market.get("question", "Unknown"))
+
+            # Filter to whale-sized trades
+            whale_trades = []
+            for t in trades:
+                # Calculate trade value (price * count)
+                price = t.get("price", t.get("yes_price", 0))
+                if price > 1:
+                    price = price / 100
+                count = t.get("count", t.get("size", 0))
+                value = price * count
+
+                if value >= config.WHALE_THRESHOLD:
+                    whale_trades.append({
+                        "side": t.get("taker_side", t.get("side", "unknown")),
+                        "price": price,
+                        "count": count,
+                        "value": value
+                    })
+
+            if len(whale_trades) < 2:
+                return None
+
+            # Analyze direction bias
+            yes_volume = sum(t["value"] for t in whale_trades if t["side"].lower() in ["yes", "buy"])
+            no_volume = sum(t["value"] for t in whale_trades if t["side"].lower() in ["no", "sell"])
+            total_volume = yes_volume + no_volume
+
+            if total_volume < config.WHALE_THRESHOLD * 2:
+                return None
+
+            # Determine dominant direction
+            if yes_volume > no_volume * 1.5:
+                direction = "YES"
+                confidence = yes_volume / total_volume
+            elif no_volume > yes_volume * 1.5:
+                direction = "NO"
+                confidence = no_volume / total_volume
+            else:
+                return None  # No clear signal
+
+            avg_price = sum(t["price"] * t["value"] for t in whale_trades) / total_volume
+
+            return WhaleSignal(
+                market_id=ticker,
+                market_title=title,
+                direction=direction,
+                total_volume=total_volume,
+                trade_count=len(whale_trades),
+                avg_price=avg_price,
+                confidence=confidence,
+                timestamp=time.time()
+            )
+
+        except Exception as e:
+            logger.error(f"Error detecting whale activity: {e}")
+            return None
+
+    def compare_event_outcomes(self, event: Dict, markets: List[Dict]) -> Dict[str, Any]:
+        """
+        Compare all outcomes in an event for NegRisk opportunities
+        Returns analysis of probability distribution
+        """
+        try:
+            prices = []
+            for m in markets:
+                yes_price = m.get("yes_price", m.get("last_price", 0))
+                if yes_price > 1:
+                    yes_price = yes_price / 100
+
+                prices.append({
+                    "ticker": m.get("ticker"),
+                    "title": m.get("title", m.get("subtitle", "")),
+                    "yes_price": yes_price,
+                    "no_price": 1 - yes_price,
+                    "volume": m.get("volume", 0)
+                })
+
+            total_probability = sum(p["yes_price"] for p in prices)
+            deviation = abs(1.0 - total_probability)
+
+            return {
+                "event_ticker": event.get("event_ticker", event.get("ticker", "")),
+                "event_title": event.get("title", ""),
+                "outcome_count": len(prices),
+                "total_probability": total_probability,
+                "deviation": deviation,
+                "is_arbitrage": deviation >= config.MIN_PROFIT_THRESHOLD,
+                "profit_potential": deviation * config.POSITION_SIZE if deviation >= config.MIN_PROFIT_THRESHOLD else 0,
+                "outcomes": prices
+            }
+
+        except Exception as e:
+            logger.error(f"Error comparing outcomes: {e}")
+            return {}
+
 
 # =============================================================================
 # MAIN ARBITRAGE BOT
@@ -564,6 +743,14 @@ class FastArbitrageBot:
         self.api_calls = 0
         self.api_errors = 0
         self.last_api_call = None
+
+        # NegRisk / Multi-outcome tracking
+        self.events = []  # Events with multiple outcomes
+        self.negrisk_opportunities = []  # Detected NegRisk arbs
+
+        # Whale tracking
+        self.whale_signals = []  # Recent whale signals
+        self.whale_trades_cache = {}  # Cache of recent trades per market
 
         self.log(f"Bot initialized - {self.mode} MODE", "⚡")
         self.log(f"Target polling: {self.poll_interval_ms}ms")
@@ -646,6 +833,153 @@ class FastArbitrageBot:
             self.log(f"Coinbase balance: ${self.wallet_balance:.2f}", "💰")
         except Exception as e:
             self.log(f"Error fetching Coinbase balance: {e}", "⚠️")
+
+    async def scan_negrisk_opportunities(self):
+        """
+        Scan for NegRisk/multi-outcome arbitrage opportunities
+        Fetches events and their markets, checks if probabilities sum to != 100%
+        IMDEA research: $28.99M extracted with 29× capital efficiency
+        """
+        if not config.ENABLE_MULTI_OUTCOME:
+            return
+
+        try:
+            self.api_calls += 1
+            events = await self.kalshi_client.get_events(limit=20, status="open")
+
+            if not events:
+                return
+
+            # Fetch markets for each event concurrently
+            async def fetch_event_markets(event):
+                event_ticker = event.get("event_ticker", event.get("ticker", ""))
+                if not event_ticker:
+                    return None
+                markets = await self.kalshi_client.get_event_markets(event_ticker)
+                self.api_calls += 1
+                return (event, markets)
+
+            results = await asyncio.gather(
+                *[fetch_event_markets(e) for e in events[:10]],  # Limit to 10 events
+                return_exceptions=True
+            )
+
+            for result in results:
+                if isinstance(result, tuple) and result[1]:
+                    event, markets = result
+                    if len(markets) >= 3:  # Need at least 3 outcomes for NegRisk
+                        opp = self.detector.detect_multi_outcome(event, markets)
+                        if opp and not self.detector.is_duplicate(opp):
+                            self.negrisk_opportunities.append(opp)
+                            self._log_negrisk_opportunity(event, markets, opp)
+
+            # Keep last 50 opportunities
+            self.negrisk_opportunities = self.negrisk_opportunities[-50:]
+
+        except Exception as e:
+            self.api_errors += 1
+            self.log(f"Error scanning NegRisk: {e}", "❌")
+
+    def _log_negrisk_opportunity(self, event: Dict, markets: List[Dict], opp: ArbitrageOpportunity):
+        """Log a NegRisk arbitrage opportunity"""
+        self.log("=" * 60, "🎯")
+        self.log(f"NEGRISK ARBITRAGE - {len(markets)} OUTCOMES", "💎")
+        self.log(f"Event: {event.get('title', 'Unknown')}")
+        self.log(f"Total Probability: {opp.total_price:.2%} (should be 100%)")
+        self.log(f"Deviation: {opp.profit_per_share:.2%}")
+        self.log(f"Profit: ${opp.profit_dollars:.2f} | ROI: {opp.roi_percent:.2f}%")
+        self.log("Outcomes:")
+        for m in markets[:5]:  # Show first 5
+            price = m.get("yes_price", 0)
+            if price > 1:
+                price = price / 100
+            self.log(f"  • {m.get('title', '')[:40]}: {price:.2%}")
+        self.log("=" * 60, "🎯")
+
+    async def scan_whale_activity(self):
+        """
+        Scan for whale trading activity across markets
+        IMDEA research: 61-68% accuracy predicting price movement
+        """
+        if not config.ENABLE_WHALE_TRACKING or not self.markets:
+            return
+
+        try:
+            # Get trades for top markets by volume
+            top_markets = sorted(
+                self.markets,
+                key=lambda m: m.get('volume', 0),
+                reverse=True
+            )[:10]
+
+            async def fetch_trades(market):
+                trades = await self.kalshi_client.get_trades(market['id'], limit=config.WHALE_LOOKBACK_TRADES)
+                self.api_calls += 1
+                return (market, trades)
+
+            results = await asyncio.gather(
+                *[fetch_trades(m) for m in top_markets],
+                return_exceptions=True
+            )
+
+            for result in results:
+                if isinstance(result, tuple) and result[1]:
+                    market, trades = result
+                    signal = self.detector.detect_whale_activity(market.get('raw', market), trades)
+                    if signal:
+                        self.whale_signals.append(signal)
+                        self._log_whale_signal(signal)
+
+            # Keep last 50 signals
+            self.whale_signals = self.whale_signals[-50:]
+
+        except Exception as e:
+            self.api_errors += 1
+            self.log(f"Error scanning whales: {e}", "❌")
+
+    def _log_whale_signal(self, signal: WhaleSignal):
+        """Log a whale trading signal"""
+        self.log("=" * 60, "🐋")
+        self.log(f"WHALE DETECTED - {signal.direction}", "🐋")
+        self.log(f"Market: {signal.market_title[:50]}")
+        self.log(f"Volume: ${signal.total_volume:,.0f} ({signal.trade_count} trades)")
+        self.log(f"Avg Price: ${signal.avg_price:.4f} | Confidence: {signal.confidence:.0%}")
+        self.log("=" * 60, "🐋")
+
+    async def parallel_market_scan(self):
+        """
+        Scan all markets in parallel for maximum speed
+        Uses batch orderbook fetching instead of sequential
+        """
+        if not self.markets:
+            return
+
+        tickers = [m['id'] for m in self.markets]
+
+        # Fetch all orderbooks in parallel
+        orderbooks = await self.kalshi_client.get_orderbooks_batch(
+            tickers,
+            max_concurrent=config.MAX_CONCURRENT_REQUESTS
+        )
+        self.api_calls += len(orderbooks)
+
+        # Process each market with its orderbook
+        for market in self.markets:
+            ticker = market['id']
+            orderbook = orderbooks.get(ticker)
+
+            if orderbook:
+                # Extract prices from orderbook
+                ob_data = orderbook.get('orderbook', {})
+                yes_orders = ob_data.get('yes', [])
+                no_orders = ob_data.get('no', [])
+
+                yes_price = yes_orders[0][0] / 100 if yes_orders else market.get('yes_price', 0.5)
+                no_price = no_orders[0][0] / 100 if no_orders else market.get('no_price', 0.5)
+            else:
+                yes_price, no_price = self.get_prices(market)
+
+            self._process_market_check(market, yes_price, no_price)
 
     def create_demo_markets(self):
         """Create local demo markets (fallback when no API)"""
@@ -882,7 +1216,11 @@ class FastArbitrageBot:
 
         # For LIVE mode, periodically refresh market list
         last_market_refresh = 0
+        last_negrisk_scan = 0
+        last_whale_scan = 0
         market_refresh_interval = 60  # Refresh market list every 60 seconds
+        negrisk_scan_interval = 30  # Scan NegRisk every 30 seconds
+        whale_scan_interval = 45  # Scan whales every 45 seconds
 
         while self.is_running:
             if self.is_paused:
@@ -891,19 +1229,27 @@ class FastArbitrageBot:
 
             target_interval = self.poll_interval_ms / 1000.0
             cycle_start = time.perf_counter_ns()
+            now = time.time()
 
             try:
-                # Refresh markets periodically in LIVE mode
                 if self.mode == "LIVE":
-                    if time.time() - last_market_refresh > market_refresh_interval:
+                    # Refresh markets periodically
+                    if now - last_market_refresh > market_refresh_interval:
                         await self.fetch_real_markets()
-                        last_market_refresh = time.time()
+                        last_market_refresh = now
 
-                    # Use async market checks for live API
-                    for market in self.markets:
-                        await self.check_market_async(market)
-                        # Rate limiting for API calls
-                        await asyncio.sleep(0.1)  # 100ms between orderbook fetches
+                    # PARALLEL market scan - no rate limiting, max speed
+                    await self.parallel_market_scan()
+
+                    # NegRisk scan (less frequent, more API calls)
+                    if config.ENABLE_MULTI_OUTCOME and now - last_negrisk_scan > negrisk_scan_interval:
+                        await self.scan_negrisk_opportunities()
+                        last_negrisk_scan = now
+
+                    # Whale tracking scan
+                    if config.ENABLE_WHALE_TRACKING and now - last_whale_scan > whale_scan_interval:
+                        await self.scan_whale_activity()
+                        last_whale_scan = now
                 else:
                     # Demo mode - sync checks
                     for market in self.markets:
@@ -980,6 +1326,31 @@ class FastArbitrageBot:
         if self.last_arb_time:
             time_since_arb = time.time() - self.last_arb_time
 
+        # Format whale signals for dashboard
+        whale_signals_data = [
+            {
+                'market_id': s.market_id,
+                'market_title': s.market_title[:50],
+                'direction': s.direction,
+                'volume': s.total_volume,
+                'confidence': s.confidence,
+                'time': datetime.fromtimestamp(s.timestamp).strftime("%H:%M:%S")
+            }
+            for s in self.whale_signals[-10:]
+        ]
+
+        # Format NegRisk opportunities for dashboard
+        negrisk_data = [
+            {
+                'event': o.market_title[:50],
+                'deviation': o.profit_per_share,
+                'profit': o.profit_dollars,
+                'roi': o.roi_percent,
+                'urgency': o.urgency
+            }
+            for o in self.negrisk_opportunities[-10:]
+        ]
+
         return {
             'mode': self.mode,
             'markets': list(self.market_prices.values()),
@@ -992,6 +1363,8 @@ class FastArbitrageBot:
             'time_since_arb': time_since_arb,
             'uptime': time.time() - self.start_time,
             'wallet_balance': self.wallet_balance,
+            'whale_signals': whale_signals_data,
+            'negrisk_opportunities': negrisk_data,
             'stats': {
                 'total_checks': self.total_checks,
                 'checks_per_sec': round(self.instant_checks_per_sec, 1),
@@ -1002,7 +1375,9 @@ class FastArbitrageBot:
                 'profit_per_min': round(profit_per_min, 2),
                 'profit_per_hour': round(profit_per_hour, 2),
                 'api_calls': self.api_calls,
-                'api_errors': self.api_errors
+                'api_errors': self.api_errors,
+                'negrisk_count': len(self.negrisk_opportunities),
+                'whale_signals_count': len(self.whale_signals)
             }
         }
 
