@@ -41,9 +41,20 @@ class Config:
     KALSHI_PRIVATE_KEY: str = os.getenv("KALSHI_PRIVATE_KEY", "")  # RSA private key path or content
     KALSHI_BASE_URL: str = os.getenv("KALSHI_BASE_URL", "https://demo-api.kalshi.co")  # Use demo by default
 
-    # Coinbase API
+    # Coinbase API (for Coinbase main)
     COINBASE_API_KEY: str = os.getenv("COINBASE_API_KEY", "")
     COINBASE_API_SECRET: str = os.getenv("COINBASE_API_SECRET", "")
+
+    # Polymarket API (Polygon-based prediction market)
+    POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
+    POLYMARKET_PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")  # Wallet private key for signing
+    POLYMARKET_CLOB_URL: str = os.getenv("POLYMARKET_CLOB_URL", "https://clob.polymarket.com")
+    POLYMARKET_GAMMA_URL: str = os.getenv("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com")
+
+    # Base L2 (Coinbase Layer 2) - for wallet integration
+    BASE_RPC_URL: str = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+    BASE_WALLET_ADDRESS: str = os.getenv("BASE_WALLET_ADDRESS", "")
+    BASE_PRIVATE_KEY: str = os.getenv("BASE_PRIVATE_KEY", "")  # For signing transactions
 
     # Scanning settings
     SCAN_INTERVAL_MS: int = int(os.getenv("SCAN_INTERVAL_MS", "1000"))  # 1 second default for real API
@@ -63,10 +74,15 @@ class Config:
     ENABLE_SINGLE_CONDITION: bool = True
     ENABLE_MULTI_OUTCOME: bool = True  # Similar to NegRisk for multi-outcome markets
     ENABLE_WHALE_TRACKING: bool = True  # Track large trades
+    ENABLE_POLYMARKET: bool = True  # Enable Polymarket scanning
+    ENABLE_CROSS_MARKET: bool = True  # Enable cross-market arbitrage (Kalshi vs Polymarket)
 
     # Whale tracking settings
     WHALE_THRESHOLD: float = float(os.getenv("WHALE_THRESHOLD", "5000"))  # $5K minimum
     WHALE_LOOKBACK_TRADES: int = 50  # Recent trades to analyze
+
+    # Cross-market arbitrage settings
+    CROSS_MARKET_MIN_SPREAD: float = float(os.getenv("CROSS_MARKET_MIN_SPREAD", "0.02"))  # 2% minimum spread
 
     # Parallel request settings
     MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
@@ -332,6 +348,305 @@ class CoinbaseClient:
 
 
 # =============================================================================
+# POLYMARKET API CLIENT
+# =============================================================================
+
+class PolymarketClient:
+    """
+    Client for Polymarket CLOB (Central Limit Order Book) API
+    Polymarket is a decentralized prediction market on Polygon
+    Uses the CLOB API for market data and trading
+    """
+
+    def __init__(self, api_key: str = "", private_key: str = ""):
+        self.api_key = api_key or config.POLYMARKET_API_KEY
+        self.private_key = private_key or config.POLYMARKET_PRIVATE_KEY
+        self.clob_url = config.POLYMARKET_CLOB_URL.rstrip('/')
+        self.gamma_url = config.POLYMARKET_GAMMA_URL.rstrip('/')
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get headers for API requests"""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def get_markets(self, limit: int = 100, active: bool = True) -> List[Dict]:
+        """
+        Fetch markets from Polymarket Gamma API
+        Returns list of prediction markets with current prices
+        """
+        try:
+            session = await self._get_session()
+            url = f"{self.gamma_url}/markets"
+            params = {
+                "limit": limit,
+                "active": str(active).lower(),
+                "closed": "false"
+            }
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else data.get("markets", [])
+                else:
+                    logger.error(f"Polymarket markets error: {resp.status}")
+                    return []
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket markets: {e}")
+            return []
+
+    async def get_market(self, condition_id: str) -> Optional[Dict]:
+        """Fetch single market details by condition ID"""
+        try:
+            session = await self._get_session()
+            url = f"{self.gamma_url}/markets/{condition_id}"
+
+            async with session.get(url, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket market {condition_id}: {e}")
+            return None
+
+    async def get_orderbook(self, token_id: str) -> Optional[Dict]:
+        """
+        Fetch orderbook from CLOB for a specific token
+        token_id is the outcome token (YES or NO token)
+        """
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/book"
+            params = {"token_id": token_id}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket orderbook {token_id}: {e}")
+            return None
+
+    async def get_price(self, token_id: str) -> Optional[Dict]:
+        """Get current price for a token"""
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/price"
+            params = {"token_id": token_id}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket price {token_id}: {e}")
+            return None
+
+    async def get_prices_batch(self, token_ids: List[str], max_concurrent: int = 10) -> Dict[str, Dict]:
+        """Fetch multiple prices concurrently"""
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def fetch_one(token_id: str) -> tuple:
+            async with semaphore:
+                price = await self.get_price(token_id)
+                return token_id, price
+
+        results = await asyncio.gather(*[fetch_one(t) for t in token_ids], return_exceptions=True)
+
+        prices = {}
+        for result in results:
+            if isinstance(result, tuple):
+                token_id, price = result
+                if price:
+                    prices[token_id] = price
+        return prices
+
+    async def get_events(self, limit: int = 50) -> List[Dict]:
+        """Fetch events (groups of related markets)"""
+        try:
+            session = await self._get_session()
+            url = f"{self.gamma_url}/events"
+            params = {"limit": limit, "active": "true", "closed": "false"}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else data.get("events", [])
+                return []
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket events: {e}")
+            return []
+
+    async def get_trades(self, market_id: str, limit: int = 100) -> List[Dict]:
+        """Fetch recent trades for a market"""
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/trades"
+            params = {"market": market_id, "limit": limit}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else data.get("trades", [])
+                return []
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket trades: {e}")
+            return []
+
+
+# =============================================================================
+# BASE L2 (COINBASE LAYER 2) CLIENT
+# =============================================================================
+
+class BaseClient:
+    """
+    Client for Base L2 (Coinbase's Ethereum Layer 2)
+    Used for wallet balance and transaction monitoring
+    Base is an Ethereum L2 built on the OP Stack
+    """
+
+    def __init__(self, rpc_url: str = "", wallet_address: str = ""):
+        self.rpc_url = rpc_url or config.BASE_RPC_URL
+        self.wallet_address = wallet_address or config.BASE_WALLET_ADDRESS
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def _rpc_call(self, method: str, params: List = None) -> Optional[Dict]:
+        """Make JSON-RPC call to Base node"""
+        try:
+            session = await self._get_session()
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params or []
+            }
+
+            async with session.post(
+                self.rpc_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "error" in data:
+                        logger.error(f"Base RPC error: {data['error']}")
+                        return None
+                    return data.get("result")
+                return None
+        except Exception as e:
+            logger.error(f"Base RPC call error: {e}")
+            return None
+
+    async def get_eth_balance(self, address: str = None) -> float:
+        """Get ETH balance on Base L2"""
+        addr = address or self.wallet_address
+        if not addr:
+            return 0.0
+
+        try:
+            result = await self._rpc_call("eth_getBalance", [addr, "latest"])
+            if result:
+                # Convert from hex wei to ETH
+                wei = int(result, 16)
+                return wei / 10**18
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error getting Base ETH balance: {e}")
+            return 0.0
+
+    async def get_token_balance(self, token_address: str, wallet_address: str = None) -> float:
+        """
+        Get ERC-20 token balance on Base
+        Common tokens on Base:
+        - USDC: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+        - USDbC (bridged USDC): 0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA
+        - DAI: 0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb
+        """
+        addr = wallet_address or self.wallet_address
+        if not addr:
+            return 0.0
+
+        try:
+            # ERC-20 balanceOf(address) function signature
+            # Function selector: 0x70a08231
+            # Pad address to 32 bytes
+            padded_addr = addr.lower().replace("0x", "").zfill(64)
+            data = f"0x70a08231{padded_addr}"
+
+            result = await self._rpc_call("eth_call", [
+                {"to": token_address, "data": data},
+                "latest"
+            ])
+
+            if result and result != "0x":
+                # Convert from hex to decimal
+                balance = int(result, 16)
+                # Assuming 6 decimals for USDC, 18 for most others
+                # For USDC on Base
+                if token_address.lower() in [
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+                    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca"   # USDbC
+                ]:
+                    return balance / 10**6
+                return balance / 10**18
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error getting Base token balance: {e}")
+            return 0.0
+
+    async def get_usdc_balance(self, wallet_address: str = None) -> float:
+        """Get USDC balance on Base (native USDC)"""
+        usdc_address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        return await self.get_token_balance(usdc_address, wallet_address)
+
+    async def get_block_number(self) -> Optional[int]:
+        """Get current block number"""
+        try:
+            result = await self._rpc_call("eth_blockNumber", [])
+            if result:
+                return int(result, 16)
+            return None
+        except Exception as e:
+            logger.error(f"Error getting Base block number: {e}")
+            return None
+
+    async def get_gas_price(self) -> Optional[float]:
+        """Get current gas price in Gwei"""
+        try:
+            result = await self._rpc_call("eth_gasPrice", [])
+            if result:
+                wei = int(result, 16)
+                return wei / 10**9  # Convert to Gwei
+            return None
+        except Exception as e:
+            logger.error(f"Error getting Base gas price: {e}")
+            return None
+
+
+# =============================================================================
 # ARBITRAGE DETECTOR
 # =============================================================================
 
@@ -364,6 +679,30 @@ class WhaleSignal:
     avg_price: float
     confidence: float  # 0-1 based on consistency
     timestamp: float
+
+
+@dataclass
+class CrossMarketOpportunity:
+    """
+    Represents a cross-market arbitrage opportunity
+    When the same event has different prices on Kalshi vs Polymarket
+    """
+    event_title: str
+    kalshi_market_id: str
+    polymarket_market_id: str
+    kalshi_yes_price: float
+    kalshi_no_price: float
+    polymarket_yes_price: float
+    polymarket_no_price: float
+    spread: float  # Price difference
+    direction: str  # "buy_kalshi_sell_poly" or "buy_poly_sell_kalshi"
+    profit_per_share: float
+    profit_dollars: float
+    roi_percent: float
+    risk_score: float
+    urgency: str
+    timestamp: float
+    details: Dict[str, Any]
 
 
 class ArbitrageDetector:
@@ -681,6 +1020,156 @@ class ArbitrageDetector:
             logger.error(f"Error comparing outcomes: {e}")
             return {}
 
+    def detect_cross_market(
+        self,
+        kalshi_market: Dict,
+        polymarket_market: Dict,
+        kalshi_orderbook: Optional[Dict] = None,
+        polymarket_price: Optional[Dict] = None
+    ) -> Optional[CrossMarketOpportunity]:
+        """
+        Detect cross-market arbitrage between Kalshi and Polymarket
+        When the same event has different prices on different platforms
+        """
+        try:
+            # Extract Kalshi prices
+            if kalshi_orderbook:
+                k_yes = kalshi_orderbook.get("yes", {}).get("ask", 0)
+                k_no = kalshi_orderbook.get("no", {}).get("ask", 0)
+            else:
+                k_yes = kalshi_market.get("yes_price", 0.5)
+                k_no = kalshi_market.get("no_price", 0.5)
+
+            # Convert from cents if needed
+            if k_yes > 1:
+                k_yes = k_yes / 100
+            if k_no > 1:
+                k_no = k_no / 100
+
+            # Extract Polymarket prices
+            if polymarket_price:
+                p_yes = float(polymarket_price.get("price", 0.5))
+                p_no = 1.0 - p_yes
+            else:
+                p_yes = float(polymarket_market.get("outcomePrices", [0.5, 0.5])[0])
+                p_no = float(polymarket_market.get("outcomePrices", [0.5, 0.5])[1])
+
+            # Validate prices
+            if k_yes <= 0 or k_no <= 0 or p_yes <= 0 or p_no <= 0:
+                return None
+
+            # Calculate spreads
+            # Strategy 1: Buy YES on Kalshi, Sell YES on Polymarket
+            spread_kalshi_to_poly = p_yes - k_yes
+
+            # Strategy 2: Buy YES on Polymarket, Sell YES on Kalshi
+            spread_poly_to_kalshi = k_yes - p_yes
+
+            # Determine best direction
+            if spread_kalshi_to_poly > spread_poly_to_kalshi:
+                spread = spread_kalshi_to_poly
+                direction = "buy_kalshi_sell_poly"
+            else:
+                spread = spread_poly_to_kalshi
+                direction = "buy_poly_sell_kalshi"
+
+            # Check if spread exceeds minimum threshold
+            if spread < config.CROSS_MARKET_MIN_SPREAD:
+                return None
+
+            profit_per_share = spread
+            profit_dollars = profit_per_share * config.POSITION_SIZE
+            roi_percent = (spread / min(k_yes, p_yes)) * 100 if min(k_yes, p_yes) > 0 else 0
+
+            # Cross-market has higher risk (execution, timing, fees)
+            risk_score = min(0.9, self._calculate_risk(kalshi_market) + 0.25)
+
+            # Determine urgency
+            if roi_percent >= config.HIGH_URGENCY_ROI * 100:
+                urgency = "high"
+            elif roi_percent >= config.MEDIUM_URGENCY_ROI * 100:
+                urgency = "medium"
+            else:
+                urgency = "low"
+
+            event_title = kalshi_market.get("title", kalshi_market.get("question", "Unknown"))
+
+            return CrossMarketOpportunity(
+                event_title=event_title,
+                kalshi_market_id=kalshi_market.get("ticker", ""),
+                polymarket_market_id=polymarket_market.get("condition_id", polymarket_market.get("id", "")),
+                kalshi_yes_price=k_yes,
+                kalshi_no_price=k_no,
+                polymarket_yes_price=p_yes,
+                polymarket_no_price=p_no,
+                spread=spread,
+                direction=direction,
+                profit_per_share=profit_per_share,
+                profit_dollars=profit_dollars,
+                roi_percent=roi_percent,
+                risk_score=risk_score,
+                urgency=urgency,
+                timestamp=time.time(),
+                details={
+                    "kalshi_market": kalshi_market,
+                    "polymarket_market": polymarket_market
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Error detecting cross-market arb: {e}")
+            return None
+
+    def match_markets(
+        self,
+        kalshi_markets: List[Dict],
+        polymarket_markets: List[Dict]
+    ) -> List[tuple]:
+        """
+        Match similar markets between Kalshi and Polymarket
+        Uses fuzzy matching on titles/questions
+        Returns list of (kalshi_market, polymarket_market) tuples
+        """
+        matches = []
+
+        # Create normalized title lookup for Polymarket
+        poly_lookup = {}
+        for pm in polymarket_markets:
+            title = pm.get("question", pm.get("title", "")).lower().strip()
+            # Normalize common variations
+            title = title.replace("will ", "").replace("?", "").strip()
+            poly_lookup[title] = pm
+
+        for km in kalshi_markets:
+            k_title = km.get("title", km.get("question", "")).lower().strip()
+            k_title = k_title.replace("will ", "").replace("?", "").strip()
+
+            # Look for exact match first
+            if k_title in poly_lookup:
+                matches.append((km, poly_lookup[k_title]))
+                continue
+
+            # Look for partial match (substring)
+            for p_title, pm in poly_lookup.items():
+                # Check if significant overlap exists
+                k_words = set(k_title.split())
+                p_words = set(p_title.split())
+
+                # Remove common words
+                common_words = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "by"}
+                k_words = k_words - common_words
+                p_words = p_words - common_words
+
+                if len(k_words) > 2 and len(p_words) > 2:
+                    overlap = len(k_words & p_words)
+                    similarity = overlap / max(len(k_words), len(p_words))
+
+                    if similarity > 0.6:  # 60% word overlap
+                        matches.append((km, pm))
+                        break
+
+        return matches
+
 
 # =============================================================================
 # MAIN ARBITRAGE BOT
@@ -697,6 +1186,8 @@ class FastArbitrageBot:
         # API Clients
         self.kalshi_client = KalshiClient()
         self.coinbase_client = CoinbaseClient()
+        self.polymarket_client = PolymarketClient()
+        self.base_client = BaseClient()
         self.detector = ArbitrageDetector()
 
         # Determine mode
@@ -751,6 +1242,18 @@ class FastArbitrageBot:
         # Whale tracking
         self.whale_signals = []  # Recent whale signals
         self.whale_trades_cache = {}  # Cache of recent trades per market
+
+        # Polymarket tracking
+        self.polymarket_markets = []  # Markets from Polymarket
+        self.polymarket_prices = {}  # Current Polymarket prices
+
+        # Cross-market arbitrage tracking
+        self.cross_market_opportunities = []  # Kalshi vs Polymarket opportunities
+        self.matched_markets = []  # Paired markets between platforms
+
+        # Base L2 wallet tracking
+        self.base_eth_balance = 0.0
+        self.base_usdc_balance = 0.0
 
         self.log(f"Bot initialized - {self.mode} MODE", "⚡")
         self.log(f"Target polling: {self.poll_interval_ms}ms")
@@ -833,6 +1336,131 @@ class FastArbitrageBot:
             self.log(f"Coinbase balance: ${self.wallet_balance:.2f}", "💰")
         except Exception as e:
             self.log(f"Error fetching Coinbase balance: {e}", "⚠️")
+
+    async def fetch_base_balance(self):
+        """Fetch wallet balances from Base L2"""
+        if not config.BASE_WALLET_ADDRESS:
+            return
+
+        try:
+            self.base_eth_balance = await self.base_client.get_eth_balance()
+            self.base_usdc_balance = await self.base_client.get_usdc_balance()
+            self.log(f"Base L2: {self.base_eth_balance:.4f} ETH | ${self.base_usdc_balance:.2f} USDC", "🔵")
+        except Exception as e:
+            self.log(f"Error fetching Base balance: {e}", "⚠️")
+
+    async def fetch_polymarket_markets(self):
+        """Fetch markets from Polymarket"""
+        if not config.ENABLE_POLYMARKET:
+            return
+
+        try:
+            self.api_calls += 1
+            self.last_api_call = time.time()
+
+            markets = await self.polymarket_client.get_markets(
+                limit=config.TOP_MARKETS,
+                active=True
+            )
+
+            if markets:
+                self.polymarket_markets = []
+                for m in markets:
+                    # Extract prices from outcome prices if available
+                    outcome_prices = m.get("outcomePrices", [])
+                    if outcome_prices and len(outcome_prices) >= 2:
+                        yes_price = float(outcome_prices[0])
+                        no_price = float(outcome_prices[1])
+                    else:
+                        yes_price = 0.5
+                        no_price = 0.5
+
+                    market = {
+                        'id': m.get('condition_id', m.get('id', '')),
+                        'question': m.get('question', m.get('title', 'Unknown')),
+                        'type': 'POLY',
+                        'yes_price': yes_price,
+                        'no_price': no_price,
+                        'volume': float(m.get('volume', m.get('volumeNum', 0)) or 0),
+                        'liquidity': float(m.get('liquidity', 0) or 0),
+                        'end_date': m.get('endDate', m.get('end_date_iso')),
+                        'raw': m,
+                        'tokens': m.get('tokens', [])  # Token IDs for orderbook
+                    }
+                    self.polymarket_markets.append(market)
+
+                self.log(f"Fetched {len(self.polymarket_markets)} markets from Polymarket", "🟣")
+
+                # Match markets with Kalshi for cross-market opportunities
+                if self.markets and config.ENABLE_CROSS_MARKET:
+                    kalshi_raw = [m.get('raw', m) for m in self.markets]
+                    poly_raw = [m.get('raw', m) for m in self.polymarket_markets]
+                    self.matched_markets = self.detector.match_markets(kalshi_raw, poly_raw)
+                    if self.matched_markets:
+                        self.log(f"Found {len(self.matched_markets)} matched markets for cross-market arb", "🔗")
+
+                return True
+            else:
+                self.log("No markets returned from Polymarket API", "⚠️")
+                return False
+
+        except Exception as e:
+            self.api_errors += 1
+            self.log(f"Error fetching Polymarket markets: {e}", "❌")
+            return False
+
+    async def scan_cross_market_opportunities(self):
+        """
+        Scan for cross-market arbitrage between Kalshi and Polymarket
+        Compares prices on matched markets between platforms
+        """
+        if not config.ENABLE_CROSS_MARKET or not self.matched_markets:
+            return
+
+        try:
+            for kalshi_market, poly_market in self.matched_markets:
+                opp = self.detector.detect_cross_market(
+                    kalshi_market,
+                    poly_market
+                )
+
+                if opp:
+                    # Check for duplicates using a combined key
+                    dup_key = f"{opp.kalshi_market_id}_{opp.polymarket_market_id}"
+                    now = time.time()
+
+                    # Simple deduplication
+                    is_dup = False
+                    for existing in self.cross_market_opportunities:
+                        existing_key = f"{existing.kalshi_market_id}_{existing.polymarket_market_id}"
+                        if existing_key == dup_key and now - existing.timestamp < 300:
+                            is_dup = True
+                            break
+
+                    if not is_dup:
+                        self.cross_market_opportunities.append(opp)
+                        self._log_cross_market_opportunity(opp)
+
+            # Keep last 50 opportunities
+            self.cross_market_opportunities = self.cross_market_opportunities[-50:]
+
+        except Exception as e:
+            self.api_errors += 1
+            self.log(f"Error scanning cross-market: {e}", "❌")
+
+    def _log_cross_market_opportunity(self, opp: CrossMarketOpportunity):
+        """Log a cross-market arbitrage opportunity"""
+        direction_text = "Kalshi→Poly" if opp.direction == "buy_kalshi_sell_poly" else "Poly→Kalshi"
+        urgency_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(opp.urgency, "🟢")
+
+        self.log("=" * 60, "🔀")
+        self.log(f"CROSS-MARKET ARBITRAGE {urgency_emoji}", "💎")
+        self.log(f"Event: {opp.event_title[:50]}")
+        self.log(f"Direction: {direction_text}")
+        self.log(f"Kalshi:     YES ${opp.kalshi_yes_price:.4f} | NO ${opp.kalshi_no_price:.4f}")
+        self.log(f"Polymarket: YES ${opp.polymarket_yes_price:.4f} | NO ${opp.polymarket_no_price:.4f}")
+        self.log(f"Spread: {opp.spread:.2%} | Profit: ${opp.profit_dollars:.2f} | ROI: {opp.roi_percent:.2f}%")
+        self.log("=" * 60, "🔀")
 
     async def scan_negrisk_opportunities(self):
         """
@@ -1218,9 +1846,13 @@ class FastArbitrageBot:
         last_market_refresh = 0
         last_negrisk_scan = 0
         last_whale_scan = 0
+        last_polymarket_refresh = 0
+        last_cross_market_scan = 0
         market_refresh_interval = 60  # Refresh market list every 60 seconds
         negrisk_scan_interval = 30  # Scan NegRisk every 30 seconds
         whale_scan_interval = 45  # Scan whales every 45 seconds
+        polymarket_refresh_interval = 60  # Refresh Polymarket every 60 seconds
+        cross_market_scan_interval = 20  # Scan cross-market every 20 seconds
 
         while self.is_running:
             if self.is_paused:
@@ -1250,6 +1882,16 @@ class FastArbitrageBot:
                     if config.ENABLE_WHALE_TRACKING and now - last_whale_scan > whale_scan_interval:
                         await self.scan_whale_activity()
                         last_whale_scan = now
+
+                    # Polymarket market refresh
+                    if config.ENABLE_POLYMARKET and now - last_polymarket_refresh > polymarket_refresh_interval:
+                        await self.fetch_polymarket_markets()
+                        last_polymarket_refresh = now
+
+                    # Cross-market arbitrage scan (Kalshi vs Polymarket)
+                    if config.ENABLE_CROSS_MARKET and now - last_cross_market_scan > cross_market_scan_interval:
+                        await self.scan_cross_market_opportunities()
+                        last_cross_market_scan = now
                 else:
                     # Demo mode - sync checks
                     for market in self.markets:
@@ -1351,6 +1993,34 @@ class FastArbitrageBot:
             for o in self.negrisk_opportunities[-10:]
         ]
 
+        # Format cross-market opportunities for dashboard
+        cross_market_data = [
+            {
+                'event': o.event_title[:50],
+                'kalshi_yes': o.kalshi_yes_price,
+                'polymarket_yes': o.polymarket_yes_price,
+                'spread': o.spread,
+                'direction': o.direction,
+                'profit': o.profit_dollars,
+                'roi': o.roi_percent,
+                'urgency': o.urgency,
+                'time': datetime.fromtimestamp(o.timestamp).strftime("%H:%M:%S")
+            }
+            for o in self.cross_market_opportunities[-10:]
+        ]
+
+        # Format Polymarket markets for dashboard
+        polymarket_data = [
+            {
+                'id': m['id'],
+                'question': m['question'][:50],
+                'yes_price': m['yes_price'],
+                'no_price': m['no_price'],
+                'volume': m['volume']
+            }
+            for m in self.polymarket_markets[:10]
+        ]
+
         return {
             'mode': self.mode,
             'markets': list(self.market_prices.values()),
@@ -1365,6 +2035,13 @@ class FastArbitrageBot:
             'wallet_balance': self.wallet_balance,
             'whale_signals': whale_signals_data,
             'negrisk_opportunities': negrisk_data,
+            'cross_market_opportunities': cross_market_data,
+            'polymarket_markets': polymarket_data,
+            'matched_markets_count': len(self.matched_markets),
+            'base_wallet': {
+                'eth_balance': self.base_eth_balance,
+                'usdc_balance': self.base_usdc_balance
+            },
             'stats': {
                 'total_checks': self.total_checks,
                 'checks_per_sec': round(self.instant_checks_per_sec, 1),
@@ -1377,7 +2054,9 @@ class FastArbitrageBot:
                 'api_calls': self.api_calls,
                 'api_errors': self.api_errors,
                 'negrisk_count': len(self.negrisk_opportunities),
-                'whale_signals_count': len(self.whale_signals)
+                'whale_signals_count': len(self.whale_signals),
+                'cross_market_count': len(self.cross_market_opportunities),
+                'polymarket_count': len(self.polymarket_markets)
             }
         }
 
@@ -1410,15 +2089,23 @@ class FastArbitrageBot:
                     self.mode = "DEMO"
                     self.create_demo_markets()
 
-                # Fetch wallet balance if Coinbase configured
-                await self.fetch_wallet_balance()
+                # Fetch wallet balances
+                await self.fetch_wallet_balance()  # Coinbase
+                await self.fetch_base_balance()     # Base L2
+
+                # Fetch Polymarket markets for cross-market arbitrage
+                if config.ENABLE_POLYMARKET:
+                    self.log("Connecting to Polymarket API...", "🟣")
+                    await self.fetch_polymarket_markets()
             else:
                 self.create_demo_markets()
 
             self.log(f"Monitoring {len(self.markets)} markets at {self.poll_interval_ms}ms...", "⚡")
+            if self.polymarket_markets:
+                self.log(f"+ {len(self.polymarket_markets)} Polymarket markets for cross-market arb", "🟣")
             self.log("Dashboard: http://localhost:5000", "🌐")
             if self.mode == "LIVE":
-                self.log("Mode: LIVE - Real Kalshi data", "🟢")
+                self.log("Mode: LIVE - Real Kalshi + Polymarket data", "🟢")
             else:
                 self.log("Mode: DEMO - Simulated data", "🟡")
 
@@ -1440,13 +2127,16 @@ class FastArbitrageBot:
             # Cleanup API sessions
             await self.kalshi_client.close()
             await self.coinbase_client.close()
+            await self.polymarket_client.close()
+            await self.base_client.close()
 
     async def wallet_updater(self):
-        """Periodically update wallet balance"""
+        """Periodically update wallet balances (Coinbase + Base L2)"""
         while self.is_running:
             await asyncio.sleep(60)  # Update every minute
             if not self.is_paused:
-                await self.fetch_wallet_balance()
+                await self.fetch_wallet_balance()  # Coinbase
+                await self.fetch_base_balance()     # Base L2
 
 
 # Flask Web Dashboard
@@ -1803,6 +2493,16 @@ DASHBOARD_HTML = """
                 <div class="stat-label">Status</div>
                 <div class="stat-value" id="status">-</div>
             </div>
+            <div class="stat-card" style="border-color: #9945FF;">
+                <div class="stat-label">Polymarket</div>
+                <div class="stat-value" id="polymarketCount" style="color: #9945FF;">0</div>
+                <div class="stat-sub" id="matchedCount">0 matched</div>
+            </div>
+            <div class="stat-card" style="border-color: #0052FF;">
+                <div class="stat-label">Base L2</div>
+                <div class="stat-value" id="baseBalance" style="color: #0052FF;">$0</div>
+                <div class="stat-sub" id="baseEth">0 ETH</div>
+            </div>
         </div>
 
         <div class="perf-bar">
@@ -1830,9 +2530,14 @@ DASHBOARD_HTML = """
 
         <div id="bestTradeContainer"></div>
 
-        <div class="section-title">📊 Markets</div>
+        <div class="section-title">📊 Kalshi Markets</div>
         <div class="markets" id="markets">
             <div class="no-data">Loading markets...</div>
+        </div>
+
+        <div class="section-title" style="color: #9945FF;">🔀 Cross-Market Arbitrage (Kalshi vs Polymarket)</div>
+        <div id="crossMarketOpps" class="trades-container" style="margin-bottom: 20px; border-color: rgba(153,69,255,0.3);">
+            <div class="no-data">Scanning for cross-market opportunities...</div>
         </div>
 
         <div class="trades-container">
@@ -1977,6 +2682,14 @@ DASHBOARD_HTML = """
                 speedSlider.value = data.stats.target_ms;
                 speedValue.textContent = data.stats.target_ms + 'ms';
 
+                // Update Polymarket and Base stats
+                document.getElementById('polymarketCount').textContent = data.stats.polymarket_count || 0;
+                document.getElementById('matchedCount').textContent = (data.matched_markets_count || 0) + ' matched';
+                if (data.base_wallet) {
+                    document.getElementById('baseBalance').textContent = '$' + (data.base_wallet.usdc_balance || 0).toFixed(2);
+                    document.getElementById('baseEth').textContent = (data.base_wallet.eth_balance || 0).toFixed(4) + ' ETH';
+                }
+
                 // Best trade
                 const bestContainer = document.getElementById('bestTradeContainer');
                 if (data.best_trade) {
@@ -2016,6 +2729,27 @@ DASHBOARD_HTML = """
                             </div>
                         </div>
                     `).join('');
+                }
+
+                // Cross-market opportunities (Kalshi vs Polymarket)
+                const crossMarketDiv = document.getElementById('crossMarketOpps');
+                if (data.cross_market_opportunities && data.cross_market_opportunities.length > 0) {
+                    crossMarketDiv.innerHTML = data.cross_market_opportunities.map(o => `
+                        <div class="trade" style="border-left-color: #9945FF; background: rgba(153,69,255,0.1);">
+                            <div class="trade-time">${o.time}</div>
+                            <div>
+                                <div class="trade-market" style="color: #9945FF;">${o.event}</div>
+                                <div class="trade-prices">
+                                    Kalshi: $${o.kalshi_yes.toFixed(4)} | Poly: $${o.polymarket_yes.toFixed(4)} | Spread: ${(o.spread * 100).toFixed(2)}%
+                                </div>
+                            </div>
+                            <div class="trade-profit" style="color: #9945FF;">+$${o.profit.toFixed(2)}</div>
+                        </div>
+                    `).join('');
+                } else if (data.matched_markets_count > 0) {
+                    crossMarketDiv.innerHTML = '<div class="no-data">Monitoring ' + data.matched_markets_count + ' matched markets...</div>';
+                } else {
+                    crossMarketDiv.innerHTML = '<div class="no-data">Searching for matching markets between Kalshi and Polymarket...</div>';
                 }
 
                 // Trades with new trade detection
@@ -2124,26 +2858,35 @@ def main():
     mode = "LIVE (Kalshi API)" if config.KALSHI_API_KEY and not config.DEMO_MODE else "DEMO (Simulated)"
 
     print(f"""
-╔════════════════════════════════════════════════════════════════╗
-║                                                                ║
-║   ⚡ KALSHI + COINBASE ARBITRAGE BOT ⚡                        ║
-║                                                                ║
-║   Based on IMDEA Networks research ($39.59M extraction)        ║
-║                                                                ║
-║   Mode: {mode:<52} ║
-║                                                                ║
-║   Strategies:                                                  ║
-║   • Single-Condition: YES + NO ≠ $1.00                         ║
-║   • Multi-Outcome: Sum of probabilities ≠ 100%                 ║
-║                                                                ║
-║   Environment Variables:                                       ║
-║   • KALSHI_API_KEY     - Kalshi email/API key                  ║
-║   • KALSHI_PRIVATE_KEY - Kalshi password/private key           ║
-║   • COINBASE_API_KEY   - Coinbase CDP API key                  ║
-║   • COINBASE_API_SECRET- Coinbase API secret                   ║
-║   • DEMO_MODE=false    - Enable live trading                   ║
-║                                                                ║
-╚════════════════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════════════╗
+║                                                                    ║
+║   ⚡ KALSHI + POLYMARKET + BASE ARBITRAGE BOT ⚡                   ║
+║                                                                    ║
+║   Based on IMDEA Networks research ($39.59M extraction)            ║
+║                                                                    ║
+║   Mode: {mode:<56} ║
+║                                                                    ║
+║   Strategies:                                                      ║
+║   • Single-Condition: YES + NO ≠ $1.00                             ║
+║   • Multi-Outcome: Sum of probabilities ≠ 100%                     ║
+║   • Cross-Market: Kalshi vs Polymarket price differences           ║
+║   • Whale Tracking: Follow large trades for signals                ║
+║                                                                    ║
+║   Platforms:                                                       ║
+║   • Kalshi     - US regulated prediction market                    ║
+║   • Polymarket - Decentralized prediction market (Polygon)         ║
+║   • Base L2    - Coinbase Layer 2 wallet integration               ║
+║                                                                    ║
+║   Environment Variables:                                           ║
+║   • KALSHI_API_KEY        - Kalshi email/API key                   ║
+║   • KALSHI_PRIVATE_KEY    - Kalshi password/private key            ║
+║   • POLYMARKET_API_KEY    - Polymarket API key (optional)          ║
+║   • BASE_WALLET_ADDRESS   - Base L2 wallet address                 ║
+║   • COINBASE_API_KEY      - Coinbase CDP API key                   ║
+║   • COINBASE_API_SECRET   - Coinbase API secret                    ║
+║   • DEMO_MODE=false       - Enable live trading                    ║
+║                                                                    ║
+╚════════════════════════════════════════════════════════════════════╝
 """)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
