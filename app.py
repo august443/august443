@@ -53,7 +53,7 @@ class Config:
 
     # Base L2 (Coinbase Layer 2) - for wallet integration
     BASE_RPC_URL: str = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
-    BASE_WALLET_ADDRESS: str = os.getenv("BASE_WALLET_ADDRESS", "")
+    BASE_WALLET_ADDRESS: str = os.getenv("BASE_WALLET_ADDRESS", "0x8475F6aAc937FdA3549431Dc4A72aC067D4E0678")
     BASE_PRIVATE_KEY: str = os.getenv("BASE_PRIVATE_KEY", "")  # For signing transactions
 
     # Scanning settings
