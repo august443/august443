@@ -68,7 +68,7 @@ class Config:
 
     # Risk management
     MAX_RISK_SCORE: float = 0.7
-    POSITION_SIZE: float = float(os.getenv("POSITION_SIZE", "10.0"))
+    POSITION_SIZE: float = float(os.getenv("POSITION_SIZE", "10.0"))  # $10 per arb (5% of $200)
 
     # Strategy toggles
     ENABLE_SINGLE_CONDITION: bool = True
@@ -91,26 +91,30 @@ class Config:
     DEMO_MODE: bool = os.getenv("DEMO_MODE", "true").lower() == "true"
 
     # ==========================================================================
-    # RISK MANAGEMENT SETTINGS (Gabagool22-style: many small trades)
+    # RISK MANAGEMENT - Configured for $200 starting capital
+    # Entry is everything. Small trades, tight limits, survive to compound.
     # ==========================================================================
 
-    # Per-trade limits
-    MAX_TRADE_SIZE: float = float(os.getenv("MAX_TRADE_SIZE", "100.0"))  # $100 max per trade
-    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.003"))  # 0.3% minimum edge
+    # Starting capital
+    STARTING_CAPITAL: float = float(os.getenv("STARTING_CAPITAL", "200.0"))
+
+    # Per-trade limits (5% of capital per trade max)
+    MAX_TRADE_SIZE: float = float(os.getenv("MAX_TRADE_SIZE", "10.0"))  # $10 per trade
+    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.005"))  # 0.5% min edge
     MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.01"))  # 1% max slippage
 
-    # Position limits
-    MAX_POSITION_PER_MARKET: float = float(os.getenv("MAX_POSITION_PER_MARKET", "500.0"))
-    MAX_TOTAL_EXPOSURE: float = float(os.getenv("MAX_TOTAL_EXPOSURE", "5000.0"))
-    MAX_CONCURRENT_ORDERS: int = int(os.getenv("MAX_CONCURRENT_ORDERS", "5"))
+    # Position limits (stay small, stay alive)
+    MAX_POSITION_PER_MARKET: float = float(os.getenv("MAX_POSITION_PER_MARKET", "25.0"))  # $25/market
+    MAX_TOTAL_EXPOSURE: float = float(os.getenv("MAX_TOTAL_EXPOSURE", "150.0"))  # 75% of capital
+    MAX_CONCURRENT_ORDERS: int = int(os.getenv("MAX_CONCURRENT_ORDERS", "3"))
 
-    # Timing limits
-    ORDER_TIMEOUT_MS: int = int(os.getenv("ORDER_TIMEOUT_MS", "5000"))  # 5 second timeout
-    STALE_PRICE_MS: int = int(os.getenv("STALE_PRICE_MS", "500"))  # Reject if data older than 500ms
+    # Timing - fast rejection of bad data
+    ORDER_TIMEOUT_MS: int = int(os.getenv("ORDER_TIMEOUT_MS", "5000"))
+    STALE_PRICE_MS: int = int(os.getenv("STALE_PRICE_MS", "500"))
 
-    # Loss limits
-    MAX_DAILY_LOSS: float = float(os.getenv("MAX_DAILY_LOSS", "500.0"))
-    MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.05"))  # 5% max drawdown
+    # Loss limits (protect the $200)
+    MAX_DAILY_LOSS: float = float(os.getenv("MAX_DAILY_LOSS", "20.0"))  # 10% daily max loss
+    MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.15"))  # 15% max drawdown
 
     # Execution mode
     LIVE_EXECUTION: bool = os.getenv("LIVE_EXECUTION", "false").lower() == "true"
