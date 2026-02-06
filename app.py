@@ -1140,6 +1140,253 @@ class PolymarketClient:
             logger.error(f"Error fetching Polymarket trades: {e}")
             return []
 
+    # =========================================================================
+    # ORDER EXECUTION - Polymarket CLOB with EIP-712 Signing
+    # =========================================================================
+
+    def _get_wallet_address(self) -> Optional[str]:
+        """Derive wallet address from private key"""
+        if not self.private_key:
+            return None
+        try:
+            # Remove 0x prefix if present
+            pk = self.private_key.replace("0x", "")
+            # Use simple ECDSA to derive address (requires eth-account or manual impl)
+            # For now, we'll require the address to be set in config
+            return config.BASE_WALLET_ADDRESS
+        except Exception:
+            return None
+
+    def _create_order_signature(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        nonce: int,
+        expiration: int
+    ) -> Optional[str]:
+        """
+        Create EIP-712 signature for Polymarket order.
+
+        Polymarket uses typed data signing (EIP-712) for order authentication.
+        This requires the user's private key to sign orders.
+        """
+        if not self.private_key:
+            logger.error("No private key configured for Polymarket signing")
+            return None
+
+        try:
+            # EIP-712 Domain for Polymarket CLOB
+            domain = {
+                "name": "Polymarket CTF Exchange",
+                "version": "1",
+                "chainId": 137,  # Polygon mainnet
+            }
+
+            # Order type structure
+            order_types = {
+                "Order": [
+                    {"name": "salt", "type": "uint256"},
+                    {"name": "maker", "type": "address"},
+                    {"name": "signer", "type": "address"},
+                    {"name": "taker", "type": "address"},
+                    {"name": "tokenId", "type": "uint256"},
+                    {"name": "makerAmount", "type": "uint256"},
+                    {"name": "takerAmount", "type": "uint256"},
+                    {"name": "expiration", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "feeRateBps", "type": "uint256"},
+                    {"name": "side", "type": "uint8"},
+                    {"name": "signatureType", "type": "uint8"},
+                ]
+            }
+
+            wallet_address = self._get_wallet_address()
+            if not wallet_address:
+                return None
+
+            # Convert price/size to amounts
+            # Polymarket uses 6 decimal places (USDC)
+            price_decimal = int(price * 1_000_000)
+            size_decimal = int(size * 1_000_000)
+
+            # Order data
+            order_data = {
+                "salt": nonce,
+                "maker": wallet_address,
+                "signer": wallet_address,
+                "taker": "0x0000000000000000000000000000000000000000",
+                "tokenId": int(token_id) if token_id.isdigit() else 0,
+                "makerAmount": size_decimal,
+                "takerAmount": price_decimal,
+                "expiration": expiration,
+                "nonce": nonce,
+                "feeRateBps": 0,
+                "side": 0 if side.upper() == "BUY" else 1,
+                "signatureType": 0,
+            }
+
+            # For actual signing, we need eth_account library
+            # This is a placeholder - real implementation needs:
+            # from eth_account import Account
+            # from eth_account.messages import encode_typed_data
+            # signature = Account.sign_typed_data(private_key, domain, order_types, order_data)
+
+            logger.warning("EIP-712 signing requires eth-account library. Install with: pip install eth-account")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error creating order signature: {e}")
+            return None
+
+    async def create_order(
+        self,
+        token_id: str,
+        side: str,           # "BUY" or "SELL"
+        price: float,        # 0.01 to 0.99
+        size: float,         # Size in USDC
+        order_type: str = "GTC"  # Good Till Cancelled
+    ) -> Dict:
+        """
+        Create and submit an order to Polymarket CLOB.
+
+        Args:
+            token_id: The outcome token ID (YES or NO token)
+            side: "BUY" or "SELL"
+            price: Price per share (0.01 to 0.99)
+            size: Order size in USDC
+
+        Returns:
+            Dict with order details or error
+        """
+        if not self.private_key:
+            return {"success": False, "error": "No private key configured"}
+
+        try:
+            # Generate nonce and expiration
+            nonce = int(time.time() * 1000)
+            expiration = int(time.time()) + 86400  # 24 hour expiry
+
+            # Create signature
+            signature = self._create_order_signature(
+                token_id, side, price, size, nonce, expiration
+            )
+
+            if not signature:
+                return {"success": False, "error": "Failed to sign order - install eth-account: pip install eth-account"}
+
+            session = await self._get_session()
+            url = f"{self.clob_url}/order"
+
+            payload = {
+                "tokenID": token_id,
+                "price": str(price),
+                "size": str(size),
+                "side": side.upper(),
+                "type": order_type,
+                "signature": signature,
+                "nonce": nonce,
+                "expiration": expiration
+            }
+
+            headers = self._get_headers()
+            if self.api_key:
+                headers["POLY_API_KEY"] = self.api_key
+
+            async with session.post(url, json=payload, headers=headers) as resp:
+                data = await resp.json()
+
+                if resp.status in (200, 201):
+                    logger.info(f"Polymarket order placed: {side} {size} @ {price}")
+                    return {
+                        "success": True,
+                        "order_id": data.get("orderID", data.get("id")),
+                        "token_id": token_id,
+                        "side": side,
+                        "price": price,
+                        "size": size,
+                        "status": data.get("status", "open"),
+                        "raw": data
+                    }
+                else:
+                    error_msg = data.get("error", data.get("message", str(data)))
+                    logger.error(f"Polymarket order failed: {resp.status} - {error_msg}")
+                    return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            logger.error(f"Error creating Polymarket order: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def cancel_order(self, order_id: str) -> Dict:
+        """Cancel an open order"""
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/order/{order_id}"
+
+            headers = self._get_headers()
+            if self.api_key:
+                headers["POLY_API_KEY"] = self.api_key
+
+            async with session.delete(url, headers=headers) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"Polymarket order cancelled: {order_id}")
+                    return {"success": True, "order_id": order_id}
+                else:
+                    data = await resp.json()
+                    return {"success": False, "error": data.get("error", "Cancel failed")}
+
+        except Exception as e:
+            logger.error(f"Error cancelling Polymarket order: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def get_open_orders(self, market: str = None) -> List[Dict]:
+        """Get open orders, optionally filtered by market"""
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/orders"
+            params = {}
+            if market:
+                params["market"] = market
+
+            headers = self._get_headers()
+            if self.api_key:
+                headers["POLY_API_KEY"] = self.api_key
+
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else data.get("orders", [])
+                return []
+
+        except Exception as e:
+            logger.error(f"Error getting Polymarket orders: {e}")
+            return []
+
+    async def get_balances(self) -> Dict:
+        """Get USDC and token balances on Polymarket"""
+        wallet = self._get_wallet_address()
+        if not wallet:
+            return {"usdc": 0.0, "positions": []}
+
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/balances"
+            params = {"address": wallet}
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "usdc": float(data.get("usdc", 0)),
+                        "positions": data.get("positions", [])
+                    }
+                return {"usdc": 0.0, "positions": []}
+
+        except Exception as e:
+            logger.error(f"Error getting Polymarket balances: {e}")
+            return {"usdc": 0.0, "positions": []}
+
 
 # =============================================================================
 # BASE L2 (COINBASE LAYER 2) CLIENT
