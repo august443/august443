@@ -90,8 +90,307 @@ class Config:
     # Mode
     DEMO_MODE: bool = os.getenv("DEMO_MODE", "true").lower() == "true"
 
+    # ==========================================================================
+    # RISK MANAGEMENT SETTINGS (Gabagool22-style: many small trades)
+    # ==========================================================================
+
+    # Per-trade limits
+    MAX_TRADE_SIZE: float = float(os.getenv("MAX_TRADE_SIZE", "100.0"))  # $100 max per trade
+    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.003"))  # 0.3% minimum edge
+    MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.01"))  # 1% max slippage
+
+    # Position limits
+    MAX_POSITION_PER_MARKET: float = float(os.getenv("MAX_POSITION_PER_MARKET", "500.0"))
+    MAX_TOTAL_EXPOSURE: float = float(os.getenv("MAX_TOTAL_EXPOSURE", "5000.0"))
+    MAX_CONCURRENT_ORDERS: int = int(os.getenv("MAX_CONCURRENT_ORDERS", "5"))
+
+    # Timing limits
+    ORDER_TIMEOUT_MS: int = int(os.getenv("ORDER_TIMEOUT_MS", "5000"))  # 5 second timeout
+    STALE_PRICE_MS: int = int(os.getenv("STALE_PRICE_MS", "500"))  # Reject if data older than 500ms
+
+    # Loss limits
+    MAX_DAILY_LOSS: float = float(os.getenv("MAX_DAILY_LOSS", "500.0"))
+    MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "0.05"))  # 5% max drawdown
+
+    # Execution mode
+    LIVE_EXECUTION: bool = os.getenv("LIVE_EXECUTION", "false").lower() == "true"
+
 
 config = Config()
+
+
+# =============================================================================
+# POSITION MANAGER - Track positions and exposure
+# =============================================================================
+
+@dataclass
+class Position:
+    """Represents a position in a single market"""
+    ticker: str
+    platform: str           # "kalshi" or "polymarket"
+    yes_contracts: int = 0
+    no_contracts: int = 0
+    avg_yes_price: float = 0.0
+    avg_no_price: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    last_updated: float = 0.0
+
+
+class PositionManager:
+    """
+    Tracks positions across all markets and platforms.
+    Essential for risk management and P&L tracking.
+    """
+
+    def __init__(self):
+        self.positions: Dict[str, Position] = {}  # key: "platform:ticker"
+        self.pending_orders: Dict[str, Dict] = {}  # key: order_id
+        self.daily_pnl: float = 0.0
+        self.daily_start_balance: float = 0.0
+        self.peak_balance: float = 0.0
+        self.total_exposure: float = 0.0
+
+    def _key(self, platform: str, ticker: str) -> str:
+        return f"{platform}:{ticker}"
+
+    def get_position(self, platform: str, ticker: str) -> Optional[Position]:
+        """Get position for a specific market"""
+        return self.positions.get(self._key(platform, ticker))
+
+    def update_position(
+        self,
+        platform: str,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price: float
+    ):
+        """Update position from a fill"""
+        key = self._key(platform, ticker)
+
+        if key not in self.positions:
+            self.positions[key] = Position(ticker=ticker, platform=platform)
+
+        pos = self.positions[key]
+        pos.last_updated = time.time()
+
+        if side == "yes":
+            if action == "buy":
+                # Update average price
+                total_contracts = pos.yes_contracts + count
+                if total_contracts > 0:
+                    pos.avg_yes_price = (
+                        (pos.avg_yes_price * pos.yes_contracts + price * count) / total_contracts
+                    )
+                pos.yes_contracts = total_contracts
+            else:  # sell
+                pos.yes_contracts = max(0, pos.yes_contracts - count)
+                # Realize P&L
+                pnl = (price - pos.avg_yes_price) * count
+                pos.realized_pnl += pnl
+                self.daily_pnl += pnl
+        else:  # no
+            if action == "buy":
+                total_contracts = pos.no_contracts + count
+                if total_contracts > 0:
+                    pos.avg_no_price = (
+                        (pos.avg_no_price * pos.no_contracts + price * count) / total_contracts
+                    )
+                pos.no_contracts = total_contracts
+            else:  # sell
+                pos.no_contracts = max(0, pos.no_contracts - count)
+                pnl = (price - pos.avg_no_price) * count
+                pos.realized_pnl += pnl
+                self.daily_pnl += pnl
+
+        self._recalc_exposure()
+
+    def _recalc_exposure(self):
+        """Recalculate total exposure"""
+        total = 0.0
+        for pos in self.positions.values():
+            # Exposure = contracts * average price
+            total += pos.yes_contracts * pos.avg_yes_price
+            total += pos.no_contracts * pos.avg_no_price
+        self.total_exposure = total
+
+    def get_market_exposure(self, platform: str, ticker: str) -> float:
+        """Get exposure for a specific market"""
+        pos = self.get_position(platform, ticker)
+        if not pos:
+            return 0.0
+        return (pos.yes_contracts * pos.avg_yes_price +
+                pos.no_contracts * pos.avg_no_price)
+
+    def add_pending_order(self, order_id: str, order_data: Dict):
+        """Track a pending order"""
+        self.pending_orders[order_id] = {
+            **order_data,
+            "created_time": time.time()
+        }
+
+    def remove_pending_order(self, order_id: str):
+        """Remove a pending order (filled or cancelled)"""
+        self.pending_orders.pop(order_id, None)
+
+    def get_pending_count(self) -> int:
+        """Get number of pending orders"""
+        return len(self.pending_orders)
+
+    def reset_daily(self, current_balance: float):
+        """Reset daily tracking (call at start of day)"""
+        self.daily_pnl = 0.0
+        self.daily_start_balance = current_balance
+        self.peak_balance = current_balance
+
+    def get_drawdown(self, current_balance: float) -> float:
+        """Calculate current drawdown from peak"""
+        if self.peak_balance <= 0:
+            return 0.0
+        self.peak_balance = max(self.peak_balance, current_balance)
+        return (self.peak_balance - current_balance) / self.peak_balance
+
+    def to_dict(self) -> Dict:
+        """Export state for dashboard"""
+        return {
+            "positions": [
+                {
+                    "ticker": p.ticker,
+                    "platform": p.platform,
+                    "yes_contracts": p.yes_contracts,
+                    "no_contracts": p.no_contracts,
+                    "realized_pnl": p.realized_pnl
+                }
+                for p in self.positions.values()
+                if p.yes_contracts > 0 or p.no_contracts > 0
+            ],
+            "pending_orders": len(self.pending_orders),
+            "total_exposure": self.total_exposure,
+            "daily_pnl": self.daily_pnl
+        }
+
+
+# =============================================================================
+# RISK MANAGER - Pre-trade checks and limits
+# =============================================================================
+
+class RiskManager:
+    """
+    Enforces risk limits before order execution.
+    All checks must pass before an order is placed.
+    """
+
+    def __init__(self, position_manager: PositionManager):
+        self.pm = position_manager
+        self.orders_today: int = 0
+        self.last_order_time: float = 0
+        self.circuit_breaker_active: bool = False
+        self.circuit_breaker_reason: str = ""
+
+    def check_all(
+        self,
+        platform: str,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price: float,
+        current_balance: float,
+        price_timestamp: float = None
+    ) -> tuple:
+        """
+        Run all pre-trade checks.
+        Returns (passed: bool, reason: str)
+        """
+        checks = [
+            self._check_circuit_breaker(),
+            self._check_daily_loss(current_balance),
+            self._check_drawdown(current_balance),
+            self._check_position_limit(platform, ticker, count, price),
+            self._check_exposure_limit(count, price),
+            self._check_trade_size(count, price),
+            self._check_pending_orders(),
+            self._check_stale_price(price_timestamp),
+        ]
+
+        for passed, reason in checks:
+            if not passed:
+                return False, reason
+
+        return True, "All checks passed"
+
+    def _check_circuit_breaker(self) -> tuple:
+        """Check if circuit breaker is active"""
+        if self.circuit_breaker_active:
+            return False, f"Circuit breaker active: {self.circuit_breaker_reason}"
+        return True, ""
+
+    def _check_daily_loss(self, current_balance: float) -> tuple:
+        """Check daily loss limit"""
+        if self.pm.daily_pnl < -config.MAX_DAILY_LOSS:
+            self.circuit_breaker_active = True
+            self.circuit_breaker_reason = f"Daily loss limit hit: ${-self.pm.daily_pnl:.2f}"
+            return False, self.circuit_breaker_reason
+        return True, ""
+
+    def _check_drawdown(self, current_balance: float) -> tuple:
+        """Check drawdown limit"""
+        drawdown = self.pm.get_drawdown(current_balance)
+        if drawdown > config.MAX_DRAWDOWN_PCT:
+            self.circuit_breaker_active = True
+            self.circuit_breaker_reason = f"Max drawdown exceeded: {drawdown:.1%}"
+            return False, self.circuit_breaker_reason
+        return True, ""
+
+    def _check_position_limit(self, platform: str, ticker: str, count: int, price: float) -> tuple:
+        """Check per-market position limit"""
+        current_exposure = self.pm.get_market_exposure(platform, ticker)
+        new_exposure = current_exposure + (count * price)
+        if new_exposure > config.MAX_POSITION_PER_MARKET:
+            return False, f"Position limit: ${new_exposure:.2f} > ${config.MAX_POSITION_PER_MARKET:.2f}"
+        return True, ""
+
+    def _check_exposure_limit(self, count: int, price: float) -> tuple:
+        """Check total exposure limit"""
+        new_total = self.pm.total_exposure + (count * price)
+        if new_total > config.MAX_TOTAL_EXPOSURE:
+            return False, f"Exposure limit: ${new_total:.2f} > ${config.MAX_TOTAL_EXPOSURE:.2f}"
+        return True, ""
+
+    def _check_trade_size(self, count: int, price: float) -> tuple:
+        """Check single trade size limit"""
+        trade_value = count * price
+        if trade_value > config.MAX_TRADE_SIZE:
+            return False, f"Trade size: ${trade_value:.2f} > ${config.MAX_TRADE_SIZE:.2f}"
+        return True, ""
+
+    def _check_pending_orders(self) -> tuple:
+        """Check concurrent order limit"""
+        if self.pm.get_pending_count() >= config.MAX_CONCURRENT_ORDERS:
+            return False, f"Too many pending orders: {self.pm.get_pending_count()}"
+        return True, ""
+
+    def _check_stale_price(self, price_timestamp: float) -> tuple:
+        """Check if price data is too old"""
+        if price_timestamp is None:
+            return True, ""  # No timestamp = skip check
+
+        age_ms = (time.time() - price_timestamp) * 1000
+        if age_ms > config.STALE_PRICE_MS:
+            return False, f"Stale price: {age_ms:.0f}ms > {config.STALE_PRICE_MS}ms"
+        return True, ""
+
+    def reset_circuit_breaker(self):
+        """Manually reset circuit breaker"""
+        self.circuit_breaker_active = False
+        self.circuit_breaker_reason = ""
+
+    def reset_daily(self):
+        """Reset daily counters"""
+        self.orders_today = 0
+        self.reset_circuit_breaker()
 
 
 # =============================================================================
@@ -270,6 +569,336 @@ class KalshiClient:
                 if ob:
                     orderbooks[ticker] = ob
         return orderbooks
+
+    # =========================================================================
+    # ORDER EXECUTION METHODS - Phase 1 HFT Implementation
+    # =========================================================================
+
+    async def get_balance(self) -> Dict[str, float]:
+        """Get account balance from Kalshi"""
+        if not self.token:
+            logger.warning("Not authenticated - cannot get balance")
+            return {"balance": 0.0, "available": 0.0}
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/balance"
+
+            async with session.get(url, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "balance": float(data.get("balance", 0)) / 100,  # Convert cents to dollars
+                        "available": float(data.get("portfolio_value", 0)) / 100
+                    }
+                else:
+                    logger.error(f"Failed to get balance: {resp.status}")
+                    return {"balance": 0.0, "available": 0.0}
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
+            return {"balance": 0.0, "available": 0.0}
+
+    async def get_positions(self) -> List[Dict]:
+        """Get current positions from Kalshi"""
+        if not self.token:
+            logger.warning("Not authenticated - cannot get positions")
+            return []
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/positions"
+
+            async with session.get(url, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    positions = data.get("market_positions", [])
+                    # Normalize position data
+                    return [
+                        {
+                            "ticker": p.get("ticker", ""),
+                            "position": p.get("position", 0),  # Positive = YES, Negative = NO
+                            "market_exposure": float(p.get("market_exposure", 0)) / 100,
+                            "realized_pnl": float(p.get("realized_pnl", 0)) / 100,
+                            "resting_orders_count": p.get("resting_orders_count", 0)
+                        }
+                        for p in positions
+                    ]
+                else:
+                    logger.error(f"Failed to get positions: {resp.status}")
+                    return []
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
+            return []
+
+    async def create_order(
+        self,
+        ticker: str,
+        side: str,           # "yes" or "no"
+        action: str,         # "buy" or "sell"
+        count: int,          # Number of contracts
+        price: int,          # Price in cents (1-99)
+        order_type: str = "limit",
+        expiration_ts: Optional[int] = None,
+        client_order_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Place an order on Kalshi.
+
+        Args:
+            ticker: Market ticker (e.g., "KXBTC-24DEC31-B100000")
+            side: "yes" or "no"
+            action: "buy" or "sell"
+            count: Number of contracts to trade
+            price: Limit price in cents (1-99)
+            order_type: "limit" or "market"
+            expiration_ts: Unix timestamp for order expiry (optional)
+            client_order_id: Your reference ID (optional)
+
+        Returns:
+            Dict with order details including order_id, or error info
+        """
+        if not self.token:
+            return {"error": "Not authenticated", "success": False}
+
+        # Validate inputs
+        if side not in ("yes", "no"):
+            return {"error": f"Invalid side: {side}", "success": False}
+        if action not in ("buy", "sell"):
+            return {"error": f"Invalid action: {action}", "success": False}
+        if not 1 <= price <= 99:
+            return {"error": f"Price must be 1-99 cents, got: {price}", "success": False}
+        if count <= 0:
+            return {"error": f"Count must be positive, got: {count}", "success": False}
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/orders"
+
+            payload = {
+                "ticker": ticker,
+                "side": side,
+                "action": action,
+                "count": count,
+                "type": order_type,
+            }
+
+            # Add price for limit orders
+            if order_type == "limit":
+                payload["yes_price" if side == "yes" else "no_price"] = price
+
+            # Optional fields
+            if expiration_ts:
+                payload["expiration_ts"] = expiration_ts
+            if client_order_id:
+                payload["client_order_id"] = client_order_id
+
+            async with session.post(url, json=payload, headers=self._get_headers()) as resp:
+                data = await resp.json()
+
+                if resp.status in (200, 201):
+                    order = data.get("order", {})
+                    logger.info(f"Order placed: {order.get('order_id')} - {action} {count} {side} @ {price}¢")
+                    return {
+                        "success": True,
+                        "order_id": order.get("order_id"),
+                        "status": order.get("status"),
+                        "ticker": ticker,
+                        "side": side,
+                        "action": action,
+                        "count": count,
+                        "price": price,
+                        "created_time": order.get("created_time"),
+                        "raw": order
+                    }
+                else:
+                    error_msg = data.get("error", {}).get("message", str(data))
+                    logger.error(f"Order failed: {resp.status} - {error_msg}")
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "status_code": resp.status
+                    }
+
+        except Exception as e:
+            logger.error(f"Error creating order: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def cancel_order(self, order_id: str) -> Dict:
+        """Cancel a pending order"""
+        if not self.token:
+            return {"error": "Not authenticated", "success": False}
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/orders/{order_id}"
+
+            async with session.delete(url, headers=self._get_headers()) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"Order cancelled: {order_id}")
+                    return {"success": True, "order_id": order_id}
+                else:
+                    data = await resp.json()
+                    error_msg = data.get("error", {}).get("message", str(data))
+                    logger.error(f"Cancel failed: {resp.status} - {error_msg}")
+                    return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            logger.error(f"Error cancelling order: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def get_order(self, order_id: str) -> Optional[Dict]:
+        """Get order status and details"""
+        if not self.token:
+            return None
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/orders/{order_id}"
+
+            async with session.get(url, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    order = data.get("order", {})
+                    return {
+                        "order_id": order.get("order_id"),
+                        "status": order.get("status"),  # "resting", "canceled", "executed"
+                        "ticker": order.get("ticker"),
+                        "side": order.get("side"),
+                        "action": order.get("action"),
+                        "original_count": order.get("count"),
+                        "remaining_count": order.get("remaining_count"),
+                        "filled_count": order.get("count", 0) - order.get("remaining_count", 0),
+                        "price": order.get("yes_price") or order.get("no_price"),
+                        "created_time": order.get("created_time"),
+                        "raw": order
+                    }
+                return None
+        except Exception as e:
+            logger.error(f"Error getting order {order_id}: {e}")
+            return None
+
+    async def get_fills(self, ticker: str = None, limit: int = 100) -> List[Dict]:
+        """Get recent fills (executed trades)"""
+        if not self.token:
+            return []
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/fills"
+            params = {"limit": limit}
+            if ticker:
+                params["ticker"] = ticker
+
+            async with session.get(url, params=params, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    fills = data.get("fills", [])
+                    return [
+                        {
+                            "trade_id": f.get("trade_id"),
+                            "order_id": f.get("order_id"),
+                            "ticker": f.get("ticker"),
+                            "side": f.get("side"),
+                            "action": f.get("action"),
+                            "count": f.get("count"),
+                            "price": f.get("yes_price") or f.get("no_price"),
+                            "created_time": f.get("created_time"),
+                            "is_taker": f.get("is_taker")
+                        }
+                        for f in fills
+                    ]
+                return []
+        except Exception as e:
+            logger.error(f"Error getting fills: {e}")
+            return []
+
+    async def execute_arbitrage_order(
+        self,
+        ticker: str,
+        yes_price: float,
+        no_price: float,
+        position_size: float = 10.0
+    ) -> Dict:
+        """
+        Execute a single-condition arbitrage: buy both YES and NO when sum < $1.
+
+        This is the core HFT execution for guaranteed profit.
+
+        Args:
+            ticker: Market ticker
+            yes_price: Current YES ask price (0-1 scale)
+            no_price: Current NO ask price (0-1 scale)
+            position_size: Dollar amount to trade
+
+        Returns:
+            Dict with execution results
+        """
+        total = yes_price + no_price
+        if total >= 1.0:
+            return {"success": False, "error": "No arbitrage - prices sum to >= $1"}
+
+        profit_per_contract = 1.0 - total
+
+        # Calculate contract count based on position size
+        # Each contract costs (yes_price + no_price) and pays $1
+        cost_per_pair = total
+        num_contracts = int(position_size / cost_per_pair)
+
+        if num_contracts <= 0:
+            return {"success": False, "error": "Position size too small"}
+
+        # Convert prices to cents for Kalshi API
+        yes_cents = int(yes_price * 100)
+        no_cents = int(no_price * 100)
+
+        results = {
+            "ticker": ticker,
+            "num_contracts": num_contracts,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "expected_profit": profit_per_contract * num_contracts,
+            "orders": []
+        }
+
+        # Place YES order
+        yes_order = await self.create_order(
+            ticker=ticker,
+            side="yes",
+            action="buy",
+            count=num_contracts,
+            price=yes_cents,
+            order_type="limit"
+        )
+        results["orders"].append({"side": "yes", "result": yes_order})
+
+        # Place NO order
+        no_order = await self.create_order(
+            ticker=ticker,
+            side="no",
+            action="buy",
+            count=num_contracts,
+            price=no_cents,
+            order_type="limit"
+        )
+        results["orders"].append({"side": "no", "result": no_order})
+
+        # Determine overall success
+        results["success"] = yes_order.get("success") and no_order.get("success")
+
+        if results["success"]:
+            results["yes_order_id"] = yes_order.get("order_id")
+            results["no_order_id"] = no_order.get("order_id")
+            logger.info(f"Arbitrage orders placed: {ticker} - {num_contracts} contracts, expected profit: ${results['expected_profit']:.2f}")
+        else:
+            # If one side failed, try to cancel the other
+            if yes_order.get("success") and not no_order.get("success"):
+                await self.cancel_order(yes_order.get("order_id"))
+                results["rolled_back"] = "yes_order_cancelled"
+            elif no_order.get("success") and not yes_order.get("success"):
+                await self.cancel_order(no_order.get("order_id"))
+                results["rolled_back"] = "no_order_cancelled"
+
+        return results
 
 
 # =============================================================================
@@ -1190,6 +1819,10 @@ class FastArbitrageBot:
         self.base_client = BaseClient()
         self.detector = ArbitrageDetector()
 
+        # Risk Management (Phase 1 HFT)
+        self.position_manager = PositionManager()
+        self.risk_manager = RiskManager(self.position_manager)
+
         # Determine mode
         if self.demo_mode or not config.KALSHI_API_KEY:
             self.mode = "DEMO"
@@ -1698,7 +2331,14 @@ class FastArbitrageBot:
         return self.get_prices(market)
 
     def execute_trade(self, market, yes, no, profit, opportunity: Optional[ArbitrageOpportunity] = None):
-        """Execute arbitrage trade (demo) or log opportunity (live)"""
+        """
+        Execute arbitrage trade.
+
+        Modes:
+        - DEMO: Simulate trade, add to P&L
+        - LIVE + LIVE_EXECUTION=false: Detect and log only
+        - LIVE + LIVE_EXECUTION=true: Actually place orders on Kalshi
+        """
         total_profit = profit * self.position_size
         now = datetime.now()
 
@@ -1715,6 +2355,37 @@ class FastArbitrageBot:
         self.log(f"Profit: ${profit:.4f}/share × {self.position_size} = ${total_profit:.2f}")
         if opportunity:
             self.log(f"ROI: {opportunity.roi_percent:.2f}% | Risk: {opportunity.risk_score:.2f}")
+
+        # Determine execution status
+        execution_status = 'simulated'
+        execution_result = None
+
+        # === LIVE EXECUTION PATH ===
+        if self.mode == "LIVE" and config.LIVE_EXECUTION:
+            # Pre-trade risk checks
+            num_contracts = int(self.position_size / (yes + no))
+            passed, reason = self.risk_manager.check_all(
+                platform="kalshi",
+                ticker=market['id'],
+                side="yes",
+                action="buy",
+                count=num_contracts,
+                price=yes,
+                current_balance=self.wallet_balance
+            )
+
+            if not passed:
+                self.log(f"⛔ BLOCKED: {reason}", "🚫")
+                execution_status = 'blocked'
+            else:
+                self.log(f"✓ Risk checks passed - EXECUTING {num_contracts} contracts", "🚀")
+                # Execute in background to not block
+                asyncio.create_task(self._execute_live_arbitrage(market, yes, no, num_contracts))
+                execution_status = 'submitted'
+        elif self.mode == "LIVE":
+            execution_status = 'detected'
+            self.log("📋 Detection only (set LIVE_EXECUTION=true to trade)", "ℹ️")
+
         self.log("=" * 60, "⚡")
 
         trade = {
@@ -1730,7 +2401,7 @@ class FastArbitrageBot:
             'strategy': strategy,
             'urgency': opportunity.urgency if opportunity else "low",
             'risk_score': opportunity.risk_score if opportunity else 0.5,
-            'status': 'detected' if self.mode == "LIVE" else 'simulated'
+            'status': execution_status
         }
 
         self.trades.append(trade)
@@ -1758,6 +2429,108 @@ class FastArbitrageBot:
         # This does NOT affect the arbitrage decision - pure math already made that call
         if config.ENABLE_WHALE_TRACKING and self.mode == "LIVE":
             asyncio.create_task(self._enrich_with_whale_data(market, trade))
+
+    async def _execute_live_arbitrage(self, market, yes_price, no_price, num_contracts):
+        """
+        Execute live arbitrage orders on Kalshi.
+        Runs in background to not block detection loop.
+        """
+        ticker = market['id']
+
+        try:
+            # Execute the arbitrage (buy both YES and NO)
+            result = await self.kalshi_client.execute_arbitrage_order(
+                ticker=ticker,
+                yes_price=yes_price,
+                no_price=no_price,
+                position_size=self.position_size
+            )
+
+            if result.get("success"):
+                self.log(f"✅ ORDERS PLACED: {ticker}", "💵")
+                self.log(f"   YES Order: {result.get('yes_order_id')}")
+                self.log(f"   NO Order: {result.get('no_order_id')}")
+                self.log(f"   Expected Profit: ${result.get('expected_profit', 0):.2f}")
+
+                # Track pending orders
+                if result.get('yes_order_id'):
+                    self.position_manager.add_pending_order(
+                        result['yes_order_id'],
+                        {"ticker": ticker, "side": "yes", "count": num_contracts}
+                    )
+                if result.get('no_order_id'):
+                    self.position_manager.add_pending_order(
+                        result['no_order_id'],
+                        {"ticker": ticker, "side": "no", "count": num_contracts}
+                    )
+
+                # Start monitoring for fills
+                asyncio.create_task(self._monitor_order_fills(
+                    result.get('yes_order_id'),
+                    result.get('no_order_id'),
+                    ticker,
+                    yes_price,
+                    no_price,
+                    num_contracts
+                ))
+            else:
+                self.log(f"❌ ORDER FAILED: {result.get('error')}", "🚫")
+                if result.get('rolled_back'):
+                    self.log(f"   Rolled back: {result['rolled_back']}")
+
+        except Exception as e:
+            self.log(f"❌ Execution error: {e}", "🚫")
+            logger.exception("Live execution failed")
+
+    async def _monitor_order_fills(self, yes_order_id, no_order_id, ticker, yes_price, no_price, count):
+        """Monitor orders until filled or timeout"""
+        timeout_sec = config.ORDER_TIMEOUT_MS / 1000
+        start_time = time.time()
+        yes_filled = False
+        no_filled = False
+
+        while time.time() - start_time < timeout_sec:
+            try:
+                if yes_order_id and not yes_filled:
+                    yes_status = await self.kalshi_client.get_order(yes_order_id)
+                    if yes_status and yes_status.get('status') == 'executed':
+                        yes_filled = True
+                        self.position_manager.update_position(
+                            "kalshi", ticker, "yes", "buy", count, yes_price
+                        )
+                        self.position_manager.remove_pending_order(yes_order_id)
+                        self.log(f"   ✓ YES filled @ ${yes_price:.4f}", "💚")
+
+                if no_order_id and not no_filled:
+                    no_status = await self.kalshi_client.get_order(no_order_id)
+                    if no_status and no_status.get('status') == 'executed':
+                        no_filled = True
+                        self.position_manager.update_position(
+                            "kalshi", ticker, "no", "buy", count, no_price
+                        )
+                        self.position_manager.remove_pending_order(no_order_id)
+                        self.log(f"   ✓ NO filled @ ${no_price:.4f}", "💚")
+
+                if yes_filled and no_filled:
+                    profit = (1.0 - yes_price - no_price) * count
+                    self.total_pnl += profit
+                    self.log(f"   💰 ARBITRAGE COMPLETE: +${profit:.2f}", "🎉")
+                    return
+
+                await asyncio.sleep(0.5)  # Check every 500ms
+
+            except Exception as e:
+                logger.debug(f"Order monitor error: {e}")
+                await asyncio.sleep(1)
+
+        # Timeout - cancel unfilled orders
+        self.log(f"⏰ Order timeout after {timeout_sec}s", "⚠️")
+        if yes_order_id and not yes_filled:
+            await self.kalshi_client.cancel_order(yes_order_id)
+            self.position_manager.remove_pending_order(yes_order_id)
+        if no_order_id and not no_filled:
+            await self.kalshi_client.cancel_order(no_order_id)
+            self.position_manager.remove_pending_order(no_order_id)
 
     async def _enrich_with_whale_data(self, market, trade):
         """
