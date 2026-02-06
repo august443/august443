@@ -1754,6 +1754,31 @@ class FastArbitrageBot:
 
         self.log(f"Total P/L: ${self.total_pnl:.2f} ({len(self.trades)} trades)", "✅")
 
+        # SECONDARY: Enrich with whale data in background (non-blocking, informational only)
+        # This does NOT affect the arbitrage decision - pure math already made that call
+        if config.ENABLE_WHALE_TRACKING and self.mode == "LIVE":
+            asyncio.create_task(self._enrich_with_whale_data(market, trade))
+
+    async def _enrich_with_whale_data(self, market, trade):
+        """
+        SECONDARY function: Enrich an already-detected opportunity with whale data.
+        This is informational only - the arbitrage decision was already made by pure math.
+        Runs in background, does not block primary detection.
+        """
+        try:
+            trades_data = await self.kalshi_client.get_trades(market['id'], limit=config.WHALE_LOOKBACK_TRADES)
+            if trades_data:
+                signal = self.detector.detect_whale_activity(market.get('raw', market), trades_data)
+                if signal:
+                    self.whale_signals.append(signal)
+                    # Just log it - this is confirmation, not decision
+                    self.log(f"  └─ Whale confirmation: {signal.direction} bias ({signal.confidence:.0%} confidence)", "🐋")
+                    # Keep last 50 signals
+                    self.whale_signals = self.whale_signals[-50:]
+        except Exception as e:
+            # Silently fail - whale data is supplementary
+            logger.debug(f"Whale enrichment failed: {e}")
+
     def check_market(self, market):
         """Check single market for arbitrage (sync version for demo)"""
         yes, no = self.get_prices(market)
@@ -1845,12 +1870,11 @@ class FastArbitrageBot:
         # For LIVE mode, periodically refresh market list
         last_market_refresh = 0
         last_negrisk_scan = 0
-        last_whale_scan = 0
         last_polymarket_refresh = 0
         last_cross_market_scan = 0
         market_refresh_interval = 60  # Refresh market list every 60 seconds
         negrisk_scan_interval = 30  # Scan NegRisk every 30 seconds
-        whale_scan_interval = 45  # Scan whales every 45 seconds
+        # NOTE: Whale tracking is now SECONDARY - runs only after arb detected, not on interval
         polymarket_refresh_interval = 60  # Refresh Polymarket every 60 seconds
         cross_market_scan_interval = 20  # Scan cross-market every 20 seconds
 
@@ -1878,10 +1902,9 @@ class FastArbitrageBot:
                         await self.scan_negrisk_opportunities()
                         last_negrisk_scan = now
 
-                    # Whale tracking scan
-                    if config.ENABLE_WHALE_TRACKING and now - last_whale_scan > whale_scan_interval:
-                        await self.scan_whale_activity()
-                        last_whale_scan = now
+                    # NOTE: Whale tracking removed from main loop - it's now SECONDARY
+                    # Only enriches opportunities AFTER they're detected by pure math
+                    # See enrich_opportunity_with_whale_data() called in execute_trade()
 
                     # Polymarket market refresh
                     if config.ENABLE_POLYMARKET and now - last_polymarket_refresh > polymarket_refresh_interval:
