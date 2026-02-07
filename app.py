@@ -1177,63 +1177,69 @@ class PolymarketClient:
             return None
 
         try:
-            # EIP-712 Domain for Polymarket CLOB
-            domain = {
-                "name": "Polymarket CTF Exchange",
-                "version": "1",
-                "chainId": 137,  # Polygon mainnet
+            from eth_account import Account
+
+            # Get wallet address from private key
+            pk = self.private_key if self.private_key.startswith("0x") else f"0x{self.private_key}"
+            account = Account.from_key(pk)
+            wallet_address = account.address
+
+            # Convert price/size to amounts (USDC has 6 decimals)
+            maker_amount = int(size * 1_000_000)
+            taker_amount = int(size * price * 1_000_000)
+
+            # EIP-712 typed data structure
+            full_message = {
+                "types": {
+                    "EIP712Domain": [
+                        {"name": "name", "type": "string"},
+                        {"name": "version", "type": "string"},
+                        {"name": "chainId", "type": "uint256"},
+                    ],
+                    "Order": [
+                        {"name": "salt", "type": "uint256"},
+                        {"name": "maker", "type": "address"},
+                        {"name": "signer", "type": "address"},
+                        {"name": "taker", "type": "address"},
+                        {"name": "tokenId", "type": "uint256"},
+                        {"name": "makerAmount", "type": "uint256"},
+                        {"name": "takerAmount", "type": "uint256"},
+                        {"name": "expiration", "type": "uint256"},
+                        {"name": "nonce", "type": "uint256"},
+                        {"name": "feeRateBps", "type": "uint256"},
+                        {"name": "side", "type": "uint8"},
+                        {"name": "signatureType", "type": "uint8"},
+                    ]
+                },
+                "primaryType": "Order",
+                "domain": {
+                    "name": "Polymarket CTF Exchange",
+                    "version": "1",
+                    "chainId": 137,  # Polygon mainnet
+                },
+                "message": {
+                    "salt": nonce,
+                    "maker": wallet_address,
+                    "signer": wallet_address,
+                    "taker": "0x0000000000000000000000000000000000000000",
+                    "tokenId": int(token_id) if token_id.isdigit() else 0,
+                    "makerAmount": maker_amount,
+                    "takerAmount": taker_amount,
+                    "expiration": expiration,
+                    "nonce": nonce,
+                    "feeRateBps": 0,
+                    "side": 0 if side.upper() == "BUY" else 1,
+                    "signatureType": 0,
+                }
             }
 
-            # Order type structure
-            order_types = {
-                "Order": [
-                    {"name": "salt", "type": "uint256"},
-                    {"name": "maker", "type": "address"},
-                    {"name": "signer", "type": "address"},
-                    {"name": "taker", "type": "address"},
-                    {"name": "tokenId", "type": "uint256"},
-                    {"name": "makerAmount", "type": "uint256"},
-                    {"name": "takerAmount", "type": "uint256"},
-                    {"name": "expiration", "type": "uint256"},
-                    {"name": "nonce", "type": "uint256"},
-                    {"name": "feeRateBps", "type": "uint256"},
-                    {"name": "side", "type": "uint8"},
-                    {"name": "signatureType", "type": "uint8"},
-                ]
-            }
+            # Sign the typed data
+            signed = Account.sign_typed_data(pk, full_message=full_message)
+            logger.info(f"Order signed by {wallet_address[:10]}...")
+            return signed.signature.hex()
 
-            wallet_address = self._get_wallet_address()
-            if not wallet_address:
-                return None
-
-            # Convert price/size to amounts
-            # Polymarket uses 6 decimal places (USDC)
-            price_decimal = int(price * 1_000_000)
-            size_decimal = int(size * 1_000_000)
-
-            # Order data
-            order_data = {
-                "salt": nonce,
-                "maker": wallet_address,
-                "signer": wallet_address,
-                "taker": "0x0000000000000000000000000000000000000000",
-                "tokenId": int(token_id) if token_id.isdigit() else 0,
-                "makerAmount": size_decimal,
-                "takerAmount": price_decimal,
-                "expiration": expiration,
-                "nonce": nonce,
-                "feeRateBps": 0,
-                "side": 0 if side.upper() == "BUY" else 1,
-                "signatureType": 0,
-            }
-
-            # For actual signing, we need eth_account library
-            # This is a placeholder - real implementation needs:
-            # from eth_account import Account
-            # from eth_account.messages import encode_typed_data
-            # signature = Account.sign_typed_data(private_key, domain, order_types, order_data)
-
-            logger.warning("EIP-712 signing requires eth-account library. Install with: pip install eth-account")
+        except ImportError:
+            logger.error("eth-account not installed. Run: pip install eth-account")
             return None
 
         except Exception as e:
