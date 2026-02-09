@@ -2193,6 +2193,16 @@ class FastArbitrageBot:
         self.base_eth_balance = 0.0
         self.base_usdc_balance = 0.0
 
+        # Circuit breaker - auto-stop on loss
+        self.auto_stop_on_loss = False
+        self.loss_limit_pct = 0.05  # 5% default
+        self.starting_capital = 200.0  # User's starting capital
+        self.circuit_breaker_triggered = False
+
+        # Entry points for chart (BTC/crypto markets)
+        self.entry_points = []  # [{time, price, side, market}]
+        self.btc_price_history = []  # [{time, price}] - last 100 points
+
         self.log(f"Bot initialized - {self.mode} MODE", "⚡")
         self.log(f"Target polling: {self.poll_interval_ms}ms")
         if self.mode == "DEMO":
@@ -3143,6 +3153,14 @@ class FastArbitrageBot:
                 'eth_balance': self.base_eth_balance,
                 'usdc_balance': self.base_usdc_balance
             },
+            # Circuit breaker state
+            'auto_stop_on_loss': self.auto_stop_on_loss,
+            'loss_limit_pct': self.loss_limit_pct,
+            'starting_capital': self.starting_capital,
+            'circuit_breaker_triggered': self.circuit_breaker_triggered,
+            # Chart data
+            'entry_points': self.entry_points[-20:],
+            'btc_price_history': self.btc_price_history[-100:],
             'stats': {
                 'total_checks': self.total_checks,
                 'checks_per_sec': round(self.instant_checks_per_sec, 1),
@@ -3171,6 +3189,66 @@ class FastArbitrageBot:
         self.is_paused = not self.is_paused
         state = "PAUSED" if self.is_paused else "RUNNING"
         self.log(f"Bot {state}", "⏸️" if self.is_paused else "▶️")
+
+    def start(self):
+        """Start the bot"""
+        self.is_running = True
+        self.is_paused = False
+        self.circuit_breaker_triggered = False
+        self.log("Bot STARTED", "▶️")
+
+    def stop(self):
+        """Stop the bot"""
+        self.is_running = False
+        self.is_paused = True
+        self.log("Bot STOPPED", "⏹️")
+
+    def set_auto_stop(self, enabled: bool, loss_pct: float = 0.05):
+        """Enable/disable auto-stop on loss"""
+        self.auto_stop_on_loss = enabled
+        self.loss_limit_pct = loss_pct
+        if enabled:
+            self.log(f"Circuit breaker ENABLED at {loss_pct*100:.0f}% loss", "🛑")
+        else:
+            self.log("Circuit breaker DISABLED", "⚠️")
+
+    def check_loss_limit(self) -> bool:
+        """Check if loss limit has been hit. Returns True if should stop."""
+        if not self.auto_stop_on_loss:
+            return False
+
+        max_loss = self.starting_capital * self.loss_limit_pct
+        if self.total_pnl <= -max_loss:
+            if not self.circuit_breaker_triggered:
+                self.circuit_breaker_triggered = True
+                self.is_paused = True
+                self.log(f"CIRCUIT BREAKER: Lost ${abs(self.total_pnl):.2f} ({self.loss_limit_pct*100:.0f}% of capital)", "🛑")
+            return True
+        return False
+
+    def add_entry_point(self, market: str, price: float, side: str):
+        """Record an entry point for the chart"""
+        self.entry_points.append({
+            'time': datetime.now().isoformat(),
+            'timestamp': time.time(),
+            'price': price,
+            'side': side,
+            'market': market
+        })
+        # Keep last 50 entry points
+        if len(self.entry_points) > 50:
+            self.entry_points = self.entry_points[-50:]
+
+    def update_btc_price(self, price: float):
+        """Update BTC price history for chart"""
+        self.btc_price_history.append({
+            'time': datetime.now().isoformat(),
+            'timestamp': time.time(),
+            'price': price
+        })
+        # Keep last 100 price points
+        if len(self.btc_price_history) > 100:
+            self.btc_price_history = self.btc_price_history[-100:]
 
     async def run(self):
         """Main run loop"""
@@ -3250,8 +3328,9 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Kalshi Arbitrage Bot</title>
+    <title>Polymarket HFT Bot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -3262,6 +3341,103 @@ DASHBOARD_HTML = """
             min-height: 100vh;
         }
         .container { max-width: 1400px; margin: 0 auto; }
+
+        /* Big Start/Stop Button */
+        .main-control {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .btn-big {
+            font-size: 1.2em;
+            padding: 15px 40px;
+            border-radius: 10px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 2px solid;
+        }
+        .btn-start {
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            border-color: #00ff88;
+            color: #000;
+        }
+        .btn-start:hover { transform: scale(1.05); box-shadow: 0 0 30px rgba(0,255,136,0.5); }
+        .btn-stop {
+            background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);
+            border-color: #ff4444;
+            color: #fff;
+        }
+        .btn-stop:hover { transform: scale(1.05); box-shadow: 0 0 30px rgba(255,68,68,0.5); }
+
+        /* Circuit Breaker Toggle */
+        .circuit-breaker {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: rgba(255,100,100,0.1);
+            border: 1px solid rgba(255,100,100,0.3);
+            padding: 12px 20px;
+            border-radius: 10px;
+        }
+        .circuit-breaker.active {
+            background: rgba(255,100,100,0.2);
+            border-color: #ff6464;
+        }
+        .circuit-breaker-label { font-size: 0.9em; color: #ff6464; }
+        .toggle-switch {
+            position: relative;
+            width: 50px;
+            height: 26px;
+        }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #333;
+            transition: 0.3s;
+            border-radius: 26px;
+        }
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: #888;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+        .toggle-switch input:checked + .toggle-slider { background-color: #ff6464; }
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(24px);
+            background-color: #fff;
+        }
+
+        /* Chart Container */
+        .chart-container {
+            background: rgba(0,0,0,0.4);
+            border: 1px solid rgba(0,212,255,0.2);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .chart-title {
+            font-size: 0.9em;
+            color: #00d4ff;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .chart-wrapper {
+            height: 200px;
+            position: relative;
+        }
 
         /* Header */
         .header {
@@ -3556,7 +3732,7 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>⚡ Kalshi Arbitrage Bot <span id="modeIndicator" class="mode-badge">-</span></h1>
+            <h1>⚡ Polymarket HFT Bot <span id="modeIndicator" class="mode-badge">-</span></h1>
             <div class="controls">
                 <div class="speed-control">
                     <span class="speed-label">Speed:</span>
@@ -3565,6 +3741,33 @@ DASHBOARD_HTML = """
                 </div>
                 <button class="btn" id="pauseBtn" onclick="togglePause()">⏸️ Pause</button>
                 <button class="btn" id="soundBtn" onclick="toggleSound()">🔇 Sound</button>
+            </div>
+        </div>
+
+        <!-- Main Control Panel -->
+        <div class="main-control">
+            <button class="btn-big btn-start" id="startStopBtn" onclick="toggleStartStop()">▶ START</button>
+
+            <div class="circuit-breaker" id="circuitBreaker">
+                <span class="circuit-breaker-label">Stop at 5% loss</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="autoStopToggle" onchange="toggleAutoStop()">
+                    <span class="toggle-slider"></span>
+                </label>
+                <span id="lossStatus" style="font-size: 0.8em; color: #888;">OFF</span>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.05); padding: 10px 15px; border-radius: 10px;">
+                <span style="font-size: 0.8em; color: #888;">Capital: $</span>
+                <input type="number" id="capitalInput" value="200" min="10" max="10000" style="width: 80px; background: #1a1a2e; border: 1px solid #333; color: #fff; padding: 5px; border-radius: 5px;">
+            </div>
+        </div>
+
+        <!-- BTC Price Chart -->
+        <div class="chart-container" id="chartSection">
+            <div class="chart-title">📈 Price Chart with Entry Points</div>
+            <div class="chart-wrapper">
+                <canvas id="priceChart"></canvas>
             </div>
         </div>
 
@@ -3670,6 +3873,124 @@ DASHBOARD_HTML = """
         let soundEnabled = false;
         let lastTradeCount = 0;
         let isPaused = false;
+        let isRunning = true;
+        let priceChart = null;
+
+        // Initialize Chart.js
+        function initChart() {
+            const ctx = document.getElementById('priceChart').getContext('2d');
+            priceChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Price',
+                        data: [],
+                        borderColor: '#00d4ff',
+                        backgroundColor: 'rgba(0, 212, 255, 0.1)',
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0
+                    }, {
+                        label: 'Entry Points',
+                        data: [],
+                        borderColor: '#00ff88',
+                        backgroundColor: '#00ff88',
+                        pointRadius: 8,
+                        pointStyle: 'triangle',
+                        showLine: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            grid: { color: 'rgba(255,255,255,0.1)' },
+                            ticks: { color: '#888', maxTicksLimit: 6 }
+                        },
+                        y: {
+                            display: true,
+                            grid: { color: 'rgba(255,255,255,0.1)' },
+                            ticks: { color: '#888' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateChart(priceHistory, entryPoints) {
+            if (!priceChart || !priceHistory || priceHistory.length === 0) return;
+
+            const labels = priceHistory.map(p => {
+                const d = new Date(p.time);
+                return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+            });
+            const prices = priceHistory.map(p => p.price);
+
+            // Entry points data
+            const entryData = entryPoints.map(e => ({
+                x: new Date(e.time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+                y: e.price
+            }));
+
+            priceChart.data.labels = labels;
+            priceChart.data.datasets[0].data = prices;
+            priceChart.data.datasets[1].data = entryData;
+            priceChart.update('none');
+        }
+
+        // Start/Stop control
+        async function toggleStartStop() {
+            const btn = document.getElementById('startStopBtn');
+            if (isRunning) {
+                await fetch('/api/stop', { method: 'POST' });
+                isRunning = false;
+                btn.textContent = '▶ START';
+                btn.className = 'btn-big btn-start';
+            } else {
+                await fetch('/api/start', { method: 'POST' });
+                isRunning = true;
+                btn.textContent = '⏹ STOP';
+                btn.className = 'btn-big btn-stop';
+            }
+        }
+
+        // Circuit breaker toggle
+        async function toggleAutoStop() {
+            const toggle = document.getElementById('autoStopToggle');
+            const enabled = toggle.checked;
+            await fetch('/api/set-auto-stop?enabled=' + enabled + '&loss_pct=0.05', { method: 'POST' });
+            updateCircuitBreakerUI(enabled);
+        }
+
+        function updateCircuitBreakerUI(enabled) {
+            const container = document.getElementById('circuitBreaker');
+            const status = document.getElementById('lossStatus');
+            if (enabled) {
+                container.classList.add('active');
+                status.textContent = 'ON - 5%';
+                status.style.color = '#ff6464';
+            } else {
+                container.classList.remove('active');
+                status.textContent = 'OFF';
+                status.style.color = '#888';
+            }
+        }
+
+        // Capital input
+        const capitalInput = document.getElementById('capitalInput');
+        capitalInput.addEventListener('change', async (e) => {
+            const capital = e.target.value;
+            await fetch('/api/set-capital?capital=' + capital, { method: 'POST' });
+        });
+
+        // Initialize chart on load
+        document.addEventListener('DOMContentLoaded', initChart);
 
         // Audio context for notification sound
         let audioCtx = null;
@@ -3887,6 +4208,36 @@ DASHBOARD_HTML = """
                 pauseBtn.textContent = isPaused ? '▶️ Resume' : '⏸️ Pause';
                 pauseBtn.classList.toggle('paused', isPaused);
 
+                // Update Start/Stop button state
+                isRunning = data.is_running;
+                const startStopBtn = document.getElementById('startStopBtn');
+                if (isRunning && !isPaused) {
+                    startStopBtn.textContent = '⏹ STOP';
+                    startStopBtn.className = 'btn-big btn-stop';
+                } else {
+                    startStopBtn.textContent = '▶ START';
+                    startStopBtn.className = 'btn-big btn-start';
+                }
+
+                // Update circuit breaker state
+                const autoStopToggle = document.getElementById('autoStopToggle');
+                autoStopToggle.checked = data.auto_stop_on_loss;
+                updateCircuitBreakerUI(data.auto_stop_on_loss);
+
+                // Show circuit breaker triggered warning
+                if (data.circuit_breaker_triggered) {
+                    document.getElementById('lossStatus').textContent = 'TRIGGERED!';
+                    document.getElementById('lossStatus').style.color = '#ff0000';
+                }
+
+                // Update capital input
+                document.getElementById('capitalInput').value = data.starting_capital || 200;
+
+                // Update price chart
+                if (data.btc_price_history && data.btc_price_history.length > 0) {
+                    updateChart(data.btc_price_history, data.entry_points || []);
+                }
+
             } catch (error) {
                 console.error('Dashboard error:', error);
             }
@@ -3926,6 +4277,45 @@ def toggle_pause():
     if bot_instance:
         bot_instance.toggle_pause()
         return jsonify({'success': True, 'paused': bot_instance.is_paused})
+    return jsonify({'error': 'Bot not running'}), 500
+
+
+@app.route('/api/start', methods=['POST'])
+def start_bot():
+    if bot_instance:
+        bot_instance.start()
+        return jsonify({'success': True, 'is_running': bot_instance.is_running})
+    return jsonify({'error': 'Bot not initialized'}), 500
+
+
+@app.route('/api/stop', methods=['POST'])
+def stop_bot():
+    if bot_instance:
+        bot_instance.stop()
+        return jsonify({'success': True, 'is_running': bot_instance.is_running})
+    return jsonify({'error': 'Bot not initialized'}), 500
+
+
+@app.route('/api/set-auto-stop', methods=['POST'])
+def set_auto_stop():
+    if bot_instance:
+        enabled = request.args.get('enabled', 'true').lower() == 'true'
+        loss_pct = request.args.get('loss_pct', 0.05, type=float)
+        bot_instance.set_auto_stop(enabled, loss_pct)
+        return jsonify({
+            'success': True,
+            'auto_stop_on_loss': bot_instance.auto_stop_on_loss,
+            'loss_limit_pct': bot_instance.loss_limit_pct
+        })
+    return jsonify({'error': 'Bot not running'}), 500
+
+
+@app.route('/api/set-capital', methods=['POST'])
+def set_capital():
+    if bot_instance:
+        capital = request.args.get('capital', 200, type=float)
+        bot_instance.starting_capital = capital
+        return jsonify({'success': True, 'starting_capital': bot_instance.starting_capital})
     return jsonify({'error': 'Bot not running'}), 500
 
 
