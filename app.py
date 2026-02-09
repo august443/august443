@@ -47,6 +47,7 @@ class Config:
 
     # Polymarket API (Polygon-based prediction market)
     POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
+    POLYMARKET_API_SECRET: str = os.getenv("POLYMARKET_API_SECRET", "")  # Ed25519 secret for API auth
     POLYMARKET_PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")  # Wallet private key for signing
     POLYMARKET_CLOB_URL: str = os.getenv("POLYMARKET_CLOB_URL", "https://clob.polymarket.com")
     POLYMARKET_GAMMA_URL: str = os.getenv("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com")
@@ -991,8 +992,9 @@ class PolymarketClient:
     Uses the CLOB API for market data and trading
     """
 
-    def __init__(self, api_key: str = "", private_key: str = ""):
+    def __init__(self, api_key: str = "", api_secret: str = "", private_key: str = ""):
         self.api_key = api_key or config.POLYMARKET_API_KEY
+        self.api_secret = api_secret or config.POLYMARKET_API_SECRET
         self.private_key = private_key or config.POLYMARKET_PRIVATE_KEY
         self.clob_url = config.POLYMARKET_CLOB_URL.rstrip('/')
         self.gamma_url = config.POLYMARKET_GAMMA_URL.rstrip('/')
@@ -1007,14 +1009,60 @@ class PolymarketClient:
         if self.session and not self.session.closed:
             await self.session.close()
 
+    def _create_api_signature(self, timestamp: int) -> Optional[str]:
+        """
+        Create Ed25519 signature for Polymarket API authentication.
+        Signs the timestamp with the API secret using Ed25519.
+        """
+        if not self.api_secret:
+            return None
+
+        try:
+            import base64
+            import hashlib
+            import hmac
+            from nacl.signing import SigningKey
+
+            # Decode the base64 secret key
+            secret_bytes = base64.b64decode(self.api_secret)
+
+            # Create signing key from secret
+            signing_key = SigningKey(secret_bytes[:32])  # Ed25519 uses 32-byte seed
+
+            # Sign the timestamp string
+            message = str(timestamp).encode('utf-8')
+            signed = signing_key.sign(message)
+
+            # Return base64-encoded signature
+            return base64.b64encode(signed.signature).decode('utf-8')
+
+        except ImportError:
+            logger.error("PyNaCl not installed. Run: pip install pynacl")
+            return None
+        except Exception as e:
+            logger.error(f"Error creating API signature: {e}")
+            return None
+
     def _get_headers(self) -> Dict[str, str]:
-        """Get headers for API requests"""
+        """Get headers for API requests with Ed25519 authentication"""
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        if self.api_key:
+
+        if self.api_key and self.api_secret:
+            # Ed25519 authentication
+            timestamp = int(time.time() * 1000)  # Unix ms
+            signature = self._create_api_signature(timestamp)
+
+            if signature:
+                headers["X-PM-Access-Key"] = self.api_key
+                headers["X-PM-Timestamp"] = str(timestamp)
+                headers["X-PM-Signature"] = signature
+        elif self.api_key:
+            # Fallback to simple Bearer token (for public endpoints)
             headers["Authorization"] = f"Bearer {self.api_key}"
+
         return headers
 
     async def get_markets(self, limit: int = 100, active: bool = True) -> List[Dict]:
@@ -3933,7 +3981,8 @@ def main():
 ║   Environment Variables:                                           ║
 ║   • KALSHI_API_KEY        - Kalshi email/API key                   ║
 ║   • KALSHI_PRIVATE_KEY    - Kalshi password/private key            ║
-║   • POLYMARKET_API_KEY    - Polymarket API key (optional)          ║
+║   • POLYMARKET_API_KEY    - Polymarket API key ID                  ║
+║   • POLYMARKET_API_SECRET - Polymarket API secret (Ed25519)        ║
 ║   • BASE_WALLET_ADDRESS   - Base L2 wallet address                 ║
 ║   • COINBASE_API_KEY      - Coinbase CDP API key                   ║
 ║   • COINBASE_API_SECRET   - Coinbase API secret                    ║
