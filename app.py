@@ -3764,7 +3764,7 @@ DASHBOARD_HTML = """
             <div class="controls">
                 <div class="speed-control">
                     <span class="speed-label">Speed:</span>
-                    <input type="range" id="speedSlider" min="10" max="100" value="30">
+                    <input type="range" id="speedSlider" min="1" max="100" value="10">
                     <span class="speed-value" id="speedValue">30ms</span>
                 </div>
                 <button class="btn" id="pauseBtn" onclick="togglePause()">⏸️ Pause</button>
