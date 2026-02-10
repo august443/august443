@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  polymarket-bot:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY}
+      - POLYMARKET_API_SECRET=${POLYMARKET_API_SECRET}
+      - DEMO_MODE=${DEMO_MODE:-false}
+      - BASE_WALLET_ADDRESS=${BASE_WALLET_ADDRESS:-0x8475F6aAc937FdA3549431Dc4A72aC067D4E0678}
+    restart: unless-stopped
