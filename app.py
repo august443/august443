@@ -89,7 +89,7 @@ class Config:
     MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 
     # Mode
-    DEMO_MODE: bool = os.getenv("DEMO_MODE", "true").lower() == "true"
+    DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"  # Default to LIVE
 
     # ==========================================================================
     # RISK MANAGEMENT - Configured for $200 starting capital
@@ -2128,8 +2128,9 @@ class FastArbitrageBot:
         self.position_manager = PositionManager()
         self.risk_manager = RiskManager(self.position_manager)
 
-        # Determine mode
-        if self.demo_mode or not config.KALSHI_API_KEY:
+        # Determine mode - LIVE if any API keys are set
+        has_api_keys = config.KALSHI_API_KEY or config.POLYMARKET_API_KEY
+        if self.demo_mode or not has_api_keys:
             self.mode = "DEMO"
         else:
             self.mode = "LIVE"
