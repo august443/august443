@@ -74,9 +74,13 @@ class Config:
     # Strategy toggles
     ENABLE_SINGLE_CONDITION: bool = True
     ENABLE_MULTI_OUTCOME: bool = True  # Similar to NegRisk for multi-outcome markets
-    ENABLE_WHALE_TRACKING: bool = True  # Track large trades
+    ENABLE_WHALE_TRACKING: bool = False  # Disabled - focus on pure math
     ENABLE_POLYMARKET: bool = True  # Enable Polymarket scanning
-    ENABLE_CROSS_MARKET: bool = True  # Enable cross-market arbitrage (Kalshi vs Polymarket)
+    ENABLE_CROSS_MARKET: bool = False  # Disabled - focus on single platform
+
+    # BTC-Only Mode - Focus on Bitcoin price prediction markets
+    BTC_ONLY_MODE: bool = True  # Only scan BTC price up/down markets
+    BTC_KEYWORDS: list = None  # Set in __post_init__
 
     # Whale tracking settings
     WHALE_THRESHOLD: float = float(os.getenv("WHALE_THRESHOLD", "5000"))  # $5K minimum
@@ -2214,6 +2218,19 @@ class FastArbitrageBot:
         t = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"[{t}] {emoji} {msg}")
 
+    def _is_btc_market(self, market: Dict) -> bool:
+        """Check if market is a Bitcoin price prediction market"""
+        title = market.get('title', market.get('question', '')).lower()
+        ticker = market.get('ticker', market.get('id', '')).lower()
+
+        btc_keywords = ['bitcoin', 'btc', 'crypto']
+        price_keywords = ['price', 'above', 'below', 'up', 'down', 'higher', 'lower']
+
+        has_btc = any(k in title or k in ticker for k in btc_keywords)
+        has_price = any(k in title for k in price_keywords)
+
+        return has_btc and has_price
+
     async def fetch_real_markets(self):
         """Fetch real markets from Kalshi API"""
         try:
@@ -2228,6 +2245,10 @@ class FastArbitrageBot:
             if markets:
                 self.markets = []
                 for m in markets:
+                    # Filter for BTC-only if enabled
+                    if config.BTC_ONLY_MODE and not self._is_btc_market(m):
+                        continue
+
                     market = {
                         'id': m.get('ticker', ''),
                         'question': m.get('title', m.get('subtitle', 'Unknown')),
@@ -2242,7 +2263,8 @@ class FastArbitrageBot:
                     if market['id'] not in self.price_history:
                         self.price_history[market['id']] = deque(maxlen=50)
 
-                self.log(f"Fetched {len(self.markets)} markets from Kalshi", "✅")
+                mode_str = "BTC" if config.BTC_ONLY_MODE else "ALL"
+                self.log(f"Fetched {len(self.markets)} {mode_str} markets from Kalshi", "✅")
                 return True
             else:
                 self.log("No markets returned from Kalshi API", "⚠️")
@@ -2315,6 +2337,10 @@ class FastArbitrageBot:
             if markets:
                 self.polymarket_markets = []
                 for m in markets:
+                    # Filter for BTC-only if enabled
+                    if config.BTC_ONLY_MODE and not self._is_btc_market(m):
+                        continue
+
                     # Extract prices from outcome prices if available
                     outcome_prices = m.get("outcomePrices", [])
                     if outcome_prices and len(outcome_prices) >= 2:
@@ -2327,7 +2353,7 @@ class FastArbitrageBot:
                     market = {
                         'id': m.get('condition_id', m.get('id', '')),
                         'question': m.get('question', m.get('title', 'Unknown')),
-                        'type': 'POLY',
+                        'type': 'BTC',
                         'yes_price': yes_price,
                         'no_price': no_price,
                         'volume': float(m.get('volume', m.get('volumeNum', 0)) or 0),
@@ -2338,7 +2364,8 @@ class FastArbitrageBot:
                     }
                     self.polymarket_markets.append(market)
 
-                self.log(f"Fetched {len(self.polymarket_markets)} markets from Polymarket", "🟣")
+                mode_str = "BTC" if config.BTC_ONLY_MODE else "ALL"
+                self.log(f"Fetched {len(self.polymarket_markets)} {mode_str} markets from Polymarket", "🟣")
 
                 # Match markets with Kalshi for cross-market opportunities
                 if self.markets and config.ENABLE_CROSS_MARKET:
@@ -3329,7 +3356,7 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Polymarket HFT Bot</title>
+    <title>BTC Price Bot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -3733,7 +3760,7 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>⚡ Polymarket HFT Bot <span id="modeIndicator" class="mode-badge">-</span></h1>
+            <h1>₿ BTC Price Bot <span id="modeIndicator" class="mode-badge">-</span></h1>
             <div class="controls">
                 <div class="speed-control">
                     <span class="speed-label">Speed:</span>
