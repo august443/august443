@@ -68,6 +68,9 @@ class Config:
     WHALE_THRESHOLD: float = float(os.getenv("WHALE_THRESHOLD", "5000"))  # $5K minimum
     WHALE_LOOKBACK_TRADES: int = 50  # Recent trades to analyze
 
+    # Polymarket API
+    POLYMARKET_ENABLED: bool = os.getenv("POLYMARKET_ENABLED", "true").lower() == "true"
+
     # Parallel request settings
     MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 
@@ -255,6 +258,46 @@ class KalshiClient:
                     orderbooks[ticker] = ob
         return orderbooks
 
+    async def place_order(self, ticker: str, action: str, side: str, count: int, price: float, order_type: str = "limit") -> Optional[Dict]:
+        """Place an order on Kalshi.
+
+        Args:
+            ticker: Market ticker
+            action: 'buy' or 'sell'
+            side: 'yes' or 'no'
+            count: Number of contracts
+            price: Price in dollars (will be converted to cents)
+            order_type: 'limit' or 'market'
+        """
+        if not self.token:
+            logger.error("Not authenticated - cannot place order")
+            return None
+
+        try:
+            session = await self._get_session()
+            url = f"{self.base_url}/trade-api/v2/portfolio/orders"
+            payload = {
+                "ticker": ticker,
+                "action": action,
+                "side": side,
+                "count": count,
+                "type": order_type,
+                "yes_price": int(price * 100),  # Convert dollars to cents
+            }
+
+            async with session.post(url, json=payload, headers=self._get_headers()) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info(f"Order placed: {action} {count} {side} @ ${price:.2f} on {ticker}")
+                    return data
+                else:
+                    error = await resp.text()
+                    logger.error(f"Order failed: {resp.status} - {error}")
+                    return None
+        except Exception as e:
+            logger.error(f"Order error on {ticker}: {e}")
+            return None
+
 
 # =============================================================================
 # COINBASE API CLIENT
@@ -329,6 +372,139 @@ class CoinbaseClient:
             if account.get("currency") == currency:
                 return float(account.get("available_balance", {}).get("value", 0))
         return 0.0
+
+
+# =============================================================================
+# POLYMARKET API CLIENT
+# =============================================================================
+
+class PolymarketClient:
+    """Client for Polymarket CLOB/Gamma API - read-only market data"""
+
+    def __init__(self):
+        self.gamma_url = "https://gamma-api.polymarket.com"
+        self.clob_url = "https://clob.polymarket.com"
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def get_markets(self, limit: int = 50) -> List[Dict]:
+        """Fetch active markets from Polymarket gamma API"""
+        try:
+            session = await self._get_session()
+            url = f"{self.gamma_url}/markets"
+            params = {"closed": "false", "limit": limit, "active": "true"}
+
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    logger.error(f"Polymarket markets error: {resp.status}")
+                    return []
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket markets: {e}")
+            return []
+
+    async def get_orderbook(self, token_id: str) -> Optional[Dict]:
+        """Fetch orderbook for a Polymarket token"""
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/book"
+            params = {"token_id": token_id}
+
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket orderbook: {e}")
+            return None
+
+    async def get_midpoint(self, token_id: str) -> Optional[float]:
+        """Fetch midpoint price for a Polymarket token"""
+        try:
+            session = await self._get_session()
+            url = f"{self.clob_url}/midpoint"
+            params = {"token_id": token_id}
+
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data.get("mid", 0))
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching Polymarket midpoint: {e}")
+            return None
+
+    def parse_market(self, raw: Dict) -> Optional[Dict]:
+        """Parse a Polymarket market into normalized format"""
+        try:
+            question = raw.get("question", "")
+            if not question:
+                return None
+
+            # Parse clobTokenIds and outcomePrices from JSON strings
+            token_ids_str = raw.get("clobTokenIds", "[]")
+            prices_str = raw.get("outcomePrices", "[]")
+
+            if isinstance(token_ids_str, str):
+                token_ids = json.loads(token_ids_str)
+            else:
+                token_ids = token_ids_str or []
+
+            if isinstance(prices_str, str):
+                prices = json.loads(prices_str)
+            else:
+                prices = prices_str or []
+
+            if len(token_ids) < 2 or len(prices) < 2:
+                return None
+
+            yes_price = float(prices[0])
+            no_price = float(prices[1])
+
+            # Skip markets with zero prices
+            if yes_price <= 0 and no_price <= 0:
+                return None
+
+            return {
+                'id': raw.get("conditionId", raw.get("id", "")),
+                'question': question,
+                'type': self._categorize(question),
+                'yes_price': yes_price,
+                'no_price': no_price,
+                'volume': float(raw.get("volume", 0) or 0),
+                'platform': 'polymarket',
+                'yes_token_id': token_ids[0],
+                'no_token_id': token_ids[1],
+                'raw': raw,
+            }
+        except Exception as e:
+            logger.debug(f"Error parsing Polymarket market: {e}")
+            return None
+
+    def _categorize(self, title: str) -> str:
+        """Categorize market by question keywords"""
+        t = title.lower()
+        if any(k in t for k in ['bitcoin', 'btc', 'crypto', 'ethereum', 'eth']):
+            return 'CRYPTO'
+        elif any(k in t for k in ['election', 'president', 'senate', 'congress', 'trump', 'biden']):
+            return 'POLITI'
+        elif any(k in t for k in ['fed', 'rate', 'inflation', 'gdp', 'economy']):
+            return 'ECON'
+        elif any(k in t for k in ['weather', 'temperature', 'hurricane', 'climate']):
+            return 'WEATHER'
+        elif any(k in t for k in ['sport', 'nba', 'nfl', 'mlb', 'ufc', 'soccer']):
+            return 'SPORTS'
+        else:
+            return 'OTHER'
 
 
 # =============================================================================
@@ -697,6 +873,7 @@ class FastArbitrageBot:
         # API Clients
         self.kalshi_client = KalshiClient()
         self.coinbase_client = CoinbaseClient()
+        self.polymarket_client = PolymarketClient()
         self.detector = ArbitrageDetector()
 
         # Determine mode
@@ -706,7 +883,8 @@ class FastArbitrageBot:
             self.mode = "LIVE"
 
         # State
-        self.markets = []
+        self.markets = []  # Kalshi markets
+        self.polymarket_markets = []  # Polymarket markets
         self.total_pnl = 0.0
         self.trades = []
         self.opportunities = []  # Current arbitrage opportunities
@@ -752,6 +930,13 @@ class FastArbitrageBot:
         self.whale_signals = []  # Recent whale signals
         self.whale_trades_cache = {}  # Cache of recent trades per market
 
+        # Pending orders for async execution in LIVE mode
+        self.pending_orders = []
+
+        # Trade log throttle - avoid spamming the same market
+        self.last_trade_log_time = {}  # market_id -> timestamp
+        self.trade_log_cooldown = 30  # seconds between logs for same market
+
         self.log(f"Bot initialized - {self.mode} MODE", "⚡")
         self.log(f"Target polling: {self.poll_interval_ms}ms")
         if self.mode == "DEMO":
@@ -784,6 +969,7 @@ class FastArbitrageBot:
                         'no_price': m.get('no_price', 50) / 100,
                         'volume': m.get('volume', 0),
                         'close_time': m.get('close_time'),
+                        'platform': 'kalshi',
                         'raw': m  # Keep raw data for detailed analysis
                     }
                     self.markets.append(market)
@@ -822,6 +1008,95 @@ class FastArbitrageBot:
             return 'SPORTS'
         else:
             return 'OTHER'
+
+    async def fetch_polymarket_markets(self):
+        """Fetch markets from Polymarket API"""
+        if not config.POLYMARKET_ENABLED:
+            return False
+
+        try:
+            self.api_calls += 1
+            raw_markets = await self.polymarket_client.get_markets(limit=config.TOP_MARKETS)
+
+            if raw_markets:
+                self.polymarket_markets = []
+                for raw in raw_markets:
+                    parsed = self.polymarket_client.parse_market(raw)
+                    if parsed:
+                        self.polymarket_markets.append(parsed)
+                        if parsed['id'] not in self.price_history:
+                            self.price_history[parsed['id']] = deque(maxlen=50)
+
+                self.log(f"Fetched {len(self.polymarket_markets)} markets from Polymarket", "✅")
+                return True
+            else:
+                self.log("No markets returned from Polymarket API", "⚠️")
+                return False
+
+        except Exception as e:
+            self.api_errors += 1
+            self.log(f"Error fetching Polymarket markets: {e}", "❌")
+            return False
+
+    async def polymarket_scan(self):
+        """Scan Polymarket markets for arbitrage opportunities"""
+        if not self.polymarket_markets:
+            return
+
+        for market in self.polymarket_markets:
+            yes_price = market.get('yes_price', 0.5)
+            no_price = market.get('no_price', 0.5)
+            self._process_market_check(market, yes_price, no_price)
+
+    async def process_pending_orders(self):
+        """Execute pending trades via Kalshi API in LIVE mode"""
+        if not self.pending_orders:
+            return
+
+        while self.pending_orders:
+            trade = self.pending_orders.pop(0)
+            try:
+                ticker = trade['market_id']
+                platform = trade.get('platform', 'kalshi')
+
+                if platform != 'kalshi':
+                    # Polymarket order placement requires wallet integration (not yet supported)
+                    trade['status'] = 'detected'
+                    self.trades.append(trade)
+                    continue
+
+                # Place YES buy order
+                yes_result = await self.kalshi_client.place_order(
+                    ticker=ticker,
+                    action="buy",
+                    side="yes",
+                    count=int(self.position_size),
+                    price=trade['yes']
+                )
+
+                # Place NO buy order
+                no_result = await self.kalshi_client.place_order(
+                    ticker=ticker,
+                    action="buy",
+                    side="no",
+                    count=int(self.position_size),
+                    price=trade['no']
+                )
+
+                if yes_result and no_result:
+                    trade['status'] = 'executed'
+                    self.total_pnl += trade['profit']
+                    self.log(f"TRADE EXECUTED: +${trade['profit']:.2f} on {ticker}", "✅")
+                else:
+                    trade['status'] = 'failed'
+                    self.log(f"TRADE FAILED: {ticker} (order rejected)", "❌")
+
+                self.trades.append(trade)
+
+            except Exception as e:
+                trade['status'] = 'failed'
+                self.trades.append(trade)
+                self.log(f"TRADE ERROR on {trade.get('market_id', '?')}: {e}", "❌")
 
     async def fetch_wallet_balance(self):
         """Fetch wallet balance from Coinbase"""
@@ -882,19 +1157,9 @@ class FastArbitrageBot:
 
     def _log_negrisk_opportunity(self, event: Dict, markets: List[Dict], opp: ArbitrageOpportunity):
         """Log a NegRisk arbitrage opportunity"""
-        self.log("=" * 60, "🎯")
-        self.log(f"NEGRISK ARBITRAGE - {len(markets)} OUTCOMES", "💎")
-        self.log(f"Event: {event.get('title', 'Unknown')}")
-        self.log(f"Total Probability: {opp.total_price:.2%} (should be 100%)")
-        self.log(f"Deviation: {opp.profit_per_share:.2%}")
-        self.log(f"Profit: ${opp.profit_dollars:.2f} | ROI: {opp.roi_percent:.2f}%")
-        self.log("Outcomes:")
-        for m in markets[:5]:  # Show first 5
-            price = m.get("yes_price", 0)
-            if price > 1:
-                price = price / 100
-            self.log(f"  • {m.get('title', '')[:40]}: {price:.2%}")
-        self.log("=" * 60, "🎯")
+        self.log(f"NEGRISK: {event.get('title', 'Unknown')[:50]} | "
+                 f"{len(markets)} outcomes | dev={opp.profit_per_share:.2%} | "
+                 f"+${opp.profit_dollars:.2f} ({opp.roi_percent:.1f}%)", "🎯")
 
     async def scan_whale_activity(self):
         """
@@ -939,12 +1204,9 @@ class FastArbitrageBot:
 
     def _log_whale_signal(self, signal: WhaleSignal):
         """Log a whale trading signal"""
-        self.log("=" * 60, "🐋")
-        self.log(f"WHALE DETECTED - {signal.direction}", "🐋")
-        self.log(f"Market: {signal.market_title[:50]}")
-        self.log(f"Volume: ${signal.total_volume:,.0f} ({signal.trade_count} trades)")
-        self.log(f"Avg Price: ${signal.avg_price:.4f} | Confidence: {signal.confidence:.0%}")
-        self.log("=" * 60, "🐋")
+        self.log(f"WHALE: {signal.direction} {signal.market_title[:40]} | "
+                 f"${signal.total_volume:,.0f} ({signal.trade_count} trades) | "
+                 f"conf={signal.confidence:.0%}", "🐋")
 
     async def parallel_market_scan(self):
         """
@@ -988,6 +1250,7 @@ class FastArbitrageBot:
                 'id': 'demo_btc_100k',
                 'question': 'Will BTC reach $100K by end of month?',
                 'type': 'CRYPTO',
+                'platform': 'kalshi',
                 'base_yes': 0.52,
                 'volatility': 0.03
             },
@@ -995,6 +1258,7 @@ class FastArbitrageBot:
                 'id': 'demo_btc_90k',
                 'question': 'Will BTC drop below $90K this week?',
                 'type': 'CRYPTO',
+                'platform': 'kalshi',
                 'base_yes': 0.35,
                 'volatility': 0.04
             },
@@ -1002,6 +1266,7 @@ class FastArbitrageBot:
                 'id': 'demo_fed_rate',
                 'question': 'Will Fed cut rates at next meeting?',
                 'type': 'ECON',
+                'platform': 'polymarket',
                 'base_yes': 0.45,
                 'volatility': 0.02
             },
@@ -1009,6 +1274,7 @@ class FastArbitrageBot:
                 'id': 'demo_eth_5k',
                 'question': 'Will ETH reach $5K this quarter?',
                 'type': 'CRYPTO',
+                'platform': 'polymarket',
                 'base_yes': 0.40,
                 'volatility': 0.04
             }
@@ -1070,45 +1336,48 @@ class FastArbitrageBot:
         return self.get_prices(market)
 
     def execute_trade(self, market, yes, no, profit, opportunity: Optional[ArbitrageOpportunity] = None):
-        """Execute arbitrage trade (demo) or log opportunity (live)"""
+        """Execute arbitrage trade - queues real orders in LIVE mode, simulates in DEMO"""
         total_profit = profit * self.position_size
         now = datetime.now()
+        market_id = market['id']
+        platform = market.get('platform', 'kalshi')
 
-        urgency_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
-            opportunity.urgency if opportunity else "low", "🟢"
-        )
+        # Throttle logging: skip if we logged this market recently
+        last_log = self.last_trade_log_time.get(market_id, 0)
+        should_log = (time.time() - last_log) > self.trade_log_cooldown
+
         strategy = opportunity.strategy if opportunity else "single_condition"
 
-        self.log("=" * 60, "⚡")
-        self.log(f"ARBITRAGE DETECTED - {market['type']} {urgency_emoji}", "💰")
-        self.log(f"Strategy: {strategy.upper()}")
-        self.log(f"Market: {market['question']}")
-        self.log(f"YES: ${yes:.4f} | NO: ${no:.4f} | Sum: ${yes+no:.4f}")
-        self.log(f"Profit: ${profit:.4f}/share × {self.position_size} = ${total_profit:.2f}")
-        if opportunity:
-            self.log(f"ROI: {opportunity.roi_percent:.2f}% | Risk: {opportunity.risk_score:.2f}")
-        self.log("=" * 60, "⚡")
+        if should_log:
+            self.log(f"ARB [{platform.upper()}] {market['type']}: {market['question'][:50]} | "
+                     f"Y=${yes:.4f} N=${no:.4f} | +${total_profit:.2f}", "💰")
+            self.last_trade_log_time[market_id] = time.time()
 
         trade = {
-            'id': len(self.trades) + 1,
+            'id': len(self.trades) + len(self.pending_orders) + 1,
             'time': now.strftime("%H:%M:%S.%f")[:-3],
             'timestamp': time.time(),
             'market': market['type'],
-            'market_id': market['id'],
+            'market_id': market_id,
             'question': market['question'],
+            'platform': platform,
             'yes': yes,
             'no': no,
             'profit': total_profit,
             'strategy': strategy,
             'urgency': opportunity.urgency if opportunity else "low",
             'risk_score': opportunity.risk_score if opportunity else 0.5,
-            'status': 'detected' if self.mode == "LIVE" else 'simulated'
+            'status': 'pending',
         }
 
-        self.trades.append(trade)
-
-        # Only add to PnL in demo mode (simulated execution)
-        if self.mode == "DEMO":
+        if self.mode == "LIVE":
+            # Queue for actual async execution via API
+            trade['status'] = 'pending'
+            self.pending_orders.append(trade)
+        else:
+            # Demo mode - simulate execution
+            trade['status'] = 'simulated'
+            self.trades.append(trade)
             self.total_pnl += total_profit
 
         self.last_arb_time = time.time()
@@ -1116,15 +1385,12 @@ class FastArbitrageBot:
         # Track opportunities
         if opportunity:
             self.opportunities.append(opportunity)
-            # Keep last 100 opportunities
             if len(self.opportunities) > 100:
                 self.opportunities = self.opportunities[-100:]
 
         # Track best trade
-        if self.best_trade is None or total_profit > self.best_trade['profit']:
+        if self.best_trade is None or total_profit > self.best_trade.get('profit', 0):
             self.best_trade = trade.copy()
-
-        self.log(f"Total P/L: ${self.total_pnl:.2f} ({len(self.trades)} trades)", "✅")
 
     def check_market(self, market):
         """Check single market for arbitrage (sync version for demo)"""
@@ -1178,6 +1444,7 @@ class FastArbitrageBot:
             'id': market['id'],
             'type': market['type'],
             'question': market['question'],
+            'platform': market.get('platform', 'kalshi'),
             'yes': yes,
             'no': no,
             'total': total,
@@ -1216,9 +1483,11 @@ class FastArbitrageBot:
 
         # For LIVE mode, periodically refresh market list
         last_market_refresh = 0
+        last_polymarket_refresh = 0
         last_negrisk_scan = 0
         last_whale_scan = 0
         market_refresh_interval = 60  # Refresh market list every 60 seconds
+        polymarket_refresh_interval = 60  # Refresh Polymarket every 60 seconds
         negrisk_scan_interval = 30  # Scan NegRisk every 30 seconds
         whale_scan_interval = 45  # Scan whales every 45 seconds
 
@@ -1233,13 +1502,25 @@ class FastArbitrageBot:
 
             try:
                 if self.mode == "LIVE":
-                    # Refresh markets periodically
+                    # Refresh Kalshi markets periodically
                     if now - last_market_refresh > market_refresh_interval:
                         await self.fetch_real_markets()
                         last_market_refresh = now
 
-                    # PARALLEL market scan - no rate limiting, max speed
+                    # Refresh Polymarket markets periodically
+                    if config.POLYMARKET_ENABLED and now - last_polymarket_refresh > polymarket_refresh_interval:
+                        await self.fetch_polymarket_markets()
+                        last_polymarket_refresh = now
+
+                    # PARALLEL Kalshi market scan
                     await self.parallel_market_scan()
+
+                    # Polymarket scan
+                    if config.POLYMARKET_ENABLED:
+                        await self.polymarket_scan()
+
+                    # Execute any pending orders via API
+                    await self.process_pending_orders()
 
                     # NegRisk scan (less frequent, more API calls)
                     if config.ENABLE_MULTI_OUTCOME and now - last_negrisk_scan > negrisk_scan_interval:
@@ -1280,9 +1561,9 @@ class FastArbitrageBot:
             self.checks = 0
 
     async def performance_reporter(self):
-        """Report performance stats every 10 seconds"""
+        """Report performance stats every 60 seconds"""
         while self.is_running:
-            await asyncio.sleep(10)
+            await asyncio.sleep(60)
 
             if self.is_paused:
                 continue
@@ -1295,16 +1576,11 @@ class FastArbitrageBot:
             min_cycle = min(cycle_times_list) if cycle_times_list else 0
             max_cycle = max(cycle_times_list) if cycle_times_list else 0
 
-            self.log("=" * 60, "📊")
-            self.log(f"PERFORMANCE REPORT [{self.mode}]", "📊")
-            self.log(f"Checks/sec: {checks_per_sec:.1f} (instant: {self.instant_checks_per_sec:.1f})")
-            self.log(f"Cycle time: avg={avg_cycle:.2f}ms min={min_cycle:.2f}ms max={max_cycle:.2f}ms")
-            self.log(f"Total checks: {self.total_checks} | Trades: {len(self.trades)} | P/L: ${self.total_pnl:.2f}")
-            if self.mode == "LIVE":
-                self.log(f"API calls: {self.api_calls} | Errors: {self.api_errors} | Markets: {len(self.markets)}")
-                if self.wallet_balance > 0:
-                    self.log(f"Coinbase Balance: ${self.wallet_balance:.2f}")
-            self.log("=" * 60, "📊")
+            markets_total = len(self.markets) + len(self.polymarket_markets)
+            self.log(f"[STATS] {checks_per_sec:.1f} chk/s | {avg_cycle:.1f}ms avg | "
+                     f"{self.total_checks} checks | {len(self.trades)} trades | "
+                     f"P/L: ${self.total_pnl:.2f} | Markets: {markets_total} "
+                     f"(K:{len(self.markets)} P:{len(self.polymarket_markets)})", "📊")
 
             self.last_report = time.time()
 
@@ -1377,7 +1653,10 @@ class FastArbitrageBot:
                 'api_calls': self.api_calls,
                 'api_errors': self.api_errors,
                 'negrisk_count': len(self.negrisk_opportunities),
-                'whale_signals_count': len(self.whale_signals)
+                'whale_signals_count': len(self.whale_signals),
+                'kalshi_markets': len(self.markets),
+                'polymarket_markets': len(self.polymarket_markets),
+                'pending_orders': len(self.pending_orders),
             }
         }
 
@@ -1403,22 +1682,33 @@ class FastArbitrageBot:
                 if config.KALSHI_API_KEY:
                     await self.kalshi_client.login()
 
-                # Fetch initial markets
+                # Fetch initial Kalshi markets
                 success = await self.fetch_real_markets()
                 if not success:
-                    self.log("Failed to fetch markets, falling back to DEMO mode", "⚠️")
+                    self.log("Failed to fetch Kalshi markets, falling back to DEMO mode", "⚠️")
                     self.mode = "DEMO"
                     self.create_demo_markets()
+
+                # Fetch initial Polymarket markets
+                if config.POLYMARKET_ENABLED:
+                    poly_success = await self.fetch_polymarket_markets()
+                    if poly_success:
+                        self.log(f"Polymarket: {len(self.polymarket_markets)} markets loaded", "🟢")
+                    else:
+                        self.log("Polymarket: no markets loaded (will retry)", "⚠️")
 
                 # Fetch wallet balance if Coinbase configured
                 await self.fetch_wallet_balance()
             else:
                 self.create_demo_markets()
 
-            self.log(f"Monitoring {len(self.markets)} markets at {self.poll_interval_ms}ms...", "⚡")
+            total_markets = len(self.markets) + len(self.polymarket_markets)
+            self.log(f"Monitoring {total_markets} markets "
+                     f"(Kalshi: {len(self.markets)}, Polymarket: {len(self.polymarket_markets)}) "
+                     f"at {self.poll_interval_ms}ms...", "⚡")
             self.log("Dashboard: http://localhost:5000", "🌐")
             if self.mode == "LIVE":
-                self.log("Mode: LIVE - Real Kalshi data", "🟢")
+                self.log("Mode: LIVE - Real market data, orders will be placed", "🟢")
             else:
                 self.log("Mode: DEMO - Simulated data", "🟡")
 
@@ -1440,6 +1730,7 @@ class FastArbitrageBot:
             # Cleanup API sessions
             await self.kalshi_client.close()
             await self.coinbase_client.close()
+            await self.polymarket_client.close()
 
     async def wallet_updater(self):
         """Periodically update wallet balance"""
@@ -1459,7 +1750,7 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Kalshi Arbitrage Bot</title>
+    <title>Kalshi + Polymarket Arbitrage Bot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1618,6 +1909,26 @@ DASHBOARD_HTML = """
         .btc { background: #f7931a; color: #000; }
         .eth { background: #627eea; color: #fff; }
         .arb-badge { color: #00ff88; font-weight: bold; font-size: 0.8em; }
+        .platform-badge {
+            font-size: 0.6em;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-weight: bold;
+            margin-left: 4px;
+        }
+        .platform-badge.kalshi { background: #4a90d9; color: #fff; }
+        .platform-badge.polymarket { background: #8b5cf6; color: #fff; }
+        .trade-status {
+            font-size: 0.65em;
+            padding: 1px 4px;
+            border-radius: 3px;
+            margin-left: 4px;
+        }
+        .trade-status.executed { background: #00ff88; color: #000; }
+        .trade-status.simulated { background: #ffaa00; color: #000; }
+        .trade-status.pending { background: #00d4ff; color: #000; }
+        .trade-status.failed { background: #ff4444; color: #fff; }
+        .trade-status.detected { background: #888; color: #fff; }
         .market-question { font-size: 0.75em; opacity: 0.6; margin-bottom: 10px; }
 
         /* Sparkline */
@@ -1765,7 +2076,7 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>⚡ Kalshi Arbitrage Bot <span id="modeIndicator" class="mode-badge">-</span></h1>
+            <h1>⚡ Kalshi + Polymarket Arb Bot <span id="modeIndicator" class="mode-badge">-</span></h1>
             <div class="controls">
                 <div class="speed-control">
                     <span class="speed-label">Speed:</span>
@@ -1798,6 +2109,11 @@ DASHBOARD_HTML = """
             <div class="stat-card">
                 <div class="stat-label">Last Arb</div>
                 <div class="stat-value" id="lastArb">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Markets</div>
+                <div class="stat-value" id="marketCount">0</div>
+                <div class="stat-sub" id="marketBreakdown">K:0 P:0</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Status</div>
@@ -1967,6 +2283,11 @@ DASHBOARD_HTML = """
                 document.getElementById('lastArb').textContent = formatTime(data.time_since_arb);
                 document.getElementById('status').textContent = data.is_paused ? '⏸️' : '🟢';
 
+                const kalshiCount = data.stats.kalshi_markets || 0;
+                const polyCount = data.stats.polymarket_markets || 0;
+                document.getElementById('marketCount').textContent = kalshiCount + polyCount;
+                document.getElementById('marketBreakdown').textContent = 'K:' + kalshiCount + ' P:' + polyCount;
+
                 document.getElementById('totalChecks').textContent = data.stats.total_checks.toLocaleString();
                 document.getElementById('targetMs').textContent = data.stats.target_ms + 'ms';
                 document.getElementById('minCycle').textContent = data.stats.min_cycle_ms + 'ms';
@@ -1996,6 +2317,7 @@ DASHBOARD_HTML = """
                         <div class="market-card ${m.is_arb ? 'arb' : ''}">
                             <div class="market-header">
                                 <span class="market-type ${m.type.toLowerCase()}">${m.type}</span>
+                                <span class="platform-badge ${m.platform || 'kalshi'}">${(m.platform || 'kalshi').toUpperCase()}</span>
                                 ${m.is_arb ? '<span class="arb-badge">⚡ ARB</span>' : ''}
                             </div>
                             <div class="market-question">${m.question}</div>
@@ -2034,7 +2356,10 @@ DASHBOARD_HTML = """
                         <div class="trade ${t.id === bestId ? 'best' : ''}">
                             <div class="trade-time">${t.time}</div>
                             <div>
-                                <div class="trade-market">${t.market}</div>
+                                <div class="trade-market">${t.market}
+                                    <span class="platform-badge ${t.platform || 'kalshi'}">${(t.platform || 'kalshi').toUpperCase()}</span>
+                                    <span class="trade-status ${t.status || 'simulated'}">${(t.status || 'simulated').toUpperCase()}</span>
+                                </div>
                                 <div class="trade-prices">Y:$${t.yes.toFixed(4)} N:$${t.no.toFixed(4)}</div>
                             </div>
                             <div class="trade-profit">+$${t.profit.toFixed(2)}</div>
@@ -2058,7 +2383,7 @@ DASHBOARD_HTML = """
         }
 
         updateDashboard();
-        setInterval(updateDashboard, 100);
+        setInterval(updateDashboard, 2000);
     </script>
 </body>
 </html>
@@ -2126,22 +2451,25 @@ def main():
     print(f"""
 ╔════════════════════════════════════════════════════════════════╗
 ║                                                                ║
-║   ⚡ KALSHI + COINBASE ARBITRAGE BOT ⚡                        ║
+║   ⚡ KALSHI + POLYMARKET ARBITRAGE BOT ⚡                      ║
 ║                                                                ║
 ║   Based on IMDEA Networks research ($39.59M extraction)        ║
 ║                                                                ║
 ║   Mode: {mode:<52} ║
 ║                                                                ║
+║   Platforms: Kalshi + Polymarket                               ║
 ║   Strategies:                                                  ║
 ║   • Single-Condition: YES + NO ≠ $1.00                         ║
 ║   • Multi-Outcome: Sum of probabilities ≠ 100%                 ║
+║   • Whale Tracking: Large trade detection                      ║
 ║                                                                ║
 ║   Environment Variables:                                       ║
-║   • KALSHI_API_KEY     - Kalshi email/API key                  ║
-║   • KALSHI_PRIVATE_KEY - Kalshi password/private key           ║
-║   • COINBASE_API_KEY   - Coinbase CDP API key                  ║
-║   • COINBASE_API_SECRET- Coinbase API secret                   ║
-║   • DEMO_MODE=false    - Enable live trading                   ║
+║   • KALSHI_API_KEY      - Kalshi email/API key                 ║
+║   • KALSHI_PRIVATE_KEY  - Kalshi password/private key          ║
+║   • COINBASE_API_KEY    - Coinbase CDP API key                 ║
+║   • COINBASE_API_SECRET - Coinbase API secret                  ║
+║   • POLYMARKET_ENABLED  - Enable Polymarket (default: true)    ║
+║   • DEMO_MODE=false     - Enable live trading                  ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
 """)
