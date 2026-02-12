@@ -413,7 +413,9 @@ class ArbitrageDetector:
                 return None
 
             # Calculate profit (buying both YES and NO should cost < $1 for arb)
-            profit_per_share = 1.0 - total_price
+            # Account for ~1% transaction fees on each side
+            total_price_with_fees = total_price * 1.01
+            profit_per_share = 1.0 - total_price_with_fees
 
             # Must exceed minimum threshold
             if profit_per_share < config.MIN_PROFIT_THRESHOLD:
@@ -976,10 +978,23 @@ class FastArbitrageBot:
 
                 yes_price = yes_orders[0][0] / 100 if yes_orders else market.get('yes_price', 0.5)
                 no_price = no_orders[0][0] / 100 if no_orders else market.get('no_price', 0.5)
+
+                # Normalize orderbook format for ArbitrageDetector
+                normalized_ob = {
+                    "yes": {
+                        "ask": yes_orders[0][0] if yes_orders else 0,
+                        "bid": yes_orders[-1][0] if yes_orders else 0,
+                    },
+                    "no": {
+                        "ask": no_orders[0][0] if no_orders else 0,
+                        "bid": no_orders[-1][0] if no_orders else 0,
+                    }
+                }
             else:
                 yes_price, no_price = self.get_prices(market)
+                normalized_ob = None
 
-            self._process_market_check(market, yes_price, no_price)
+            self._process_market_check(market, yes_price, no_price, normalized_ob)
 
     def create_demo_markets(self):
         """Create local demo markets (fallback when no API)"""
@@ -1136,7 +1151,7 @@ class FastArbitrageBot:
         yes, no = await self.get_prices_async(market)
         self._process_market_check(market, yes, no)
 
-    def _process_market_check(self, market, yes, no):
+    def _process_market_check(self, market, yes, no, orderbook=None):
         """Process market check and detect arbitrage"""
         # Track timing for checks/sec calculation
         now_ns = time.perf_counter_ns()
@@ -1164,7 +1179,7 @@ class FastArbitrageBot:
         if self.mode == "LIVE" and config.ENABLE_SINGLE_CONDITION:
             opportunity = self.detector.detect_single_condition(
                 market.get('raw', market),
-                None  # Could pass orderbook here
+                orderbook
             )
 
         # Determine if this is an arbitrage opportunity
@@ -1383,7 +1398,7 @@ class FastArbitrageBot:
 
     def set_speed(self, ms):
         """Set polling speed"""
-        self.poll_interval_ms = max(10, min(200, ms))
+        self.poll_interval_ms = max(10, min(2000, ms))
         self.log(f"Polling speed set to {self.poll_interval_ms}ms", "⚙️")
 
     def toggle_pause(self):
@@ -1769,7 +1784,7 @@ DASHBOARD_HTML = """
             <div class="controls">
                 <div class="speed-control">
                     <span class="speed-label">Speed:</span>
-                    <input type="range" id="speedSlider" min="10" max="100" value="30">
+                    <input type="range" id="speedSlider" min="10" max="2000" value="1000">
                     <span class="speed-value" id="speedValue">30ms</span>
                 </div>
                 <button class="btn" id="pauseBtn" onclick="togglePause()">⏸️ Pause</button>
@@ -2124,26 +2139,26 @@ def main():
     mode = "LIVE (Kalshi API)" if config.KALSHI_API_KEY and not config.DEMO_MODE else "DEMO (Simulated)"
 
     print(f"""
-╔════════════════════════════════════════════════════════════════╗
-║                                                                ║
-║   ⚡ KALSHI + COINBASE ARBITRAGE BOT ⚡                        ║
-║                                                                ║
-║   Based on IMDEA Networks research ($39.59M extraction)        ║
-║                                                                ║
-║   Mode: {mode:<52} ║
-║                                                                ║
-║   Strategies:                                                  ║
-║   • Single-Condition: YES + NO ≠ $1.00                         ║
-║   • Multi-Outcome: Sum of probabilities ≠ 100%                 ║
-║                                                                ║
-║   Environment Variables:                                       ║
-║   • KALSHI_API_KEY     - Kalshi email/API key                  ║
-║   • KALSHI_PRIVATE_KEY - Kalshi password/private key           ║
-║   • COINBASE_API_KEY   - Coinbase CDP API key                  ║
-║   • COINBASE_API_SECRET- Coinbase API secret                   ║
-║   • DEMO_MODE=false    - Enable live trading                   ║
-║                                                                ║
-╚════════════════════════════════════════════════════════════════╝
++----------------------------------------------------------------+
+|                                                                |
+|   KALSHI + COINBASE ARBITRAGE BOT                              |
+|                                                                |
+|   Based on IMDEA Networks research ($39.59M extraction)        |
+|                                                                |
+|   Mode: {mode:<53} |
+|                                                                |
+|   Strategies:                                                  |
+|   - Single-Condition: YES + NO != $1.00                        |
+|   - Multi-Outcome: Sum of probabilities != 100%                |
+|                                                                |
+|   Environment Variables:                                       |
+|   - KALSHI_API_KEY      - Kalshi email/API key                 |
+|   - KALSHI_PRIVATE_KEY  - Kalshi password/private key          |
+|   - COINBASE_API_KEY    - Coinbase CDP API key                 |
+|   - COINBASE_API_SECRET - Coinbase API secret                  |
+|   - DEMO_MODE=false     - Enable live trading                  |
+|                                                                |
++----------------------------------------------------------------+
 """)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
