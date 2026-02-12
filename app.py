@@ -746,6 +746,9 @@ class FastArbitrageBot:
         self.api_errors = 0
         self.last_api_call = None
 
+        # Activity log (last 100 entries for dashboard)
+        self.activity_log = deque(maxlen=100)
+
         # NegRisk / Multi-outcome tracking
         self.events = []  # Events with multiple outcomes
         self.negrisk_opportunities = []  # Detected NegRisk arbs
@@ -763,6 +766,11 @@ class FastArbitrageBot:
         """Logging with millisecond precision"""
         t = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"[{t}] {emoji} {msg}")
+        self.activity_log.append({
+            'time': t,
+            'emoji': emoji,
+            'msg': msg
+        })
 
     async def fetch_real_markets(self):
         """Fetch real markets from Kalshi API"""
@@ -1393,7 +1401,8 @@ class FastArbitrageBot:
                 'api_errors': self.api_errors,
                 'negrisk_count': len(self.negrisk_opportunities),
                 'whale_signals_count': len(self.whale_signals)
-            }
+            },
+            'activity_log': list(self.activity_log)[-50:]
         }
 
     def set_speed(self, ms):
@@ -1683,6 +1692,39 @@ DASHBOARD_HTML = """
         .best-trade-profit { font-size: 1.5em; color: #ffd700; font-weight: bold; }
         .best-trade-details { font-size: 0.75em; opacity: 0.7; margin-top: 4px; }
 
+        /* Activity Log */
+        .activity-log-container {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            overflow: hidden;
+            margin-top: 20px;
+        }
+        .activity-log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            background: rgba(0,0,0,0.3);
+        }
+        .activity-log-header h3 { font-size: 0.85em; color: #00d4ff; }
+        .activity-log {
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.75em;
+        }
+        .log-entry {
+            padding: 3px 8px;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            display: flex;
+            gap: 8px;
+            line-height: 1.5;
+        }
+        .log-entry:hover { background: rgba(255,255,255,0.03); }
+        .log-time { color: #666; white-space: nowrap; }
+        .log-msg { color: #ccc; word-break: break-word; }
+
         /* Trades */
         .trades-container {
             background: rgba(0,0,0,0.3);
@@ -1859,6 +1901,15 @@ DASHBOARD_HTML = """
             </div>
             <div class="trades" id="trades">
                 <div class="no-data">Waiting for arbitrage...</div>
+            </div>
+        </div>
+
+        <div class="activity-log-container">
+            <div class="activity-log-header">
+                <h3>Activity Log</h3>
+            </div>
+            <div class="activity-log" id="activityLog">
+                <div class="no-data">Waiting for activity...</div>
             </div>
         </div>
     </div>
@@ -2060,6 +2111,14 @@ DASHBOARD_HTML = """
                     if (document.getElementById('autoScroll').checked) {
                         tradesDiv.scrollTop = 0;
                     }
+                }
+
+                // Activity Log
+                const logDiv = document.getElementById('activityLog');
+                if (data.activity_log && data.activity_log.length > 0) {
+                    logDiv.innerHTML = data.activity_log.slice().reverse().map(entry =>
+                        `<div class="log-entry"><span class="log-time">[${entry.time}]</span><span class="log-msg">${entry.emoji} ${entry.msg}</span></div>`
+                    ).join('');
                 }
 
                 isPaused = data.is_paused;
