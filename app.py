@@ -111,6 +111,18 @@ class KalshiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
+    def _is_token_expired(self) -> bool:
+        """Check if auth token needs refresh"""
+        if not self.token:
+            return True
+        # Refresh 60 seconds before actual expiry to avoid race
+        return time.time() > (self.token_expires - 60)
+
+    async def _ensure_auth(self):
+        """Re-authenticate if token is expired"""
+        if self._is_token_expired() and self.api_key:
+            await self.login()
+
     async def login(self) -> bool:
         """Authenticate with Kalshi API"""
         if not self.api_key:
@@ -142,6 +154,7 @@ class KalshiClient:
     async def get_markets(self, limit: int = 100, status: str = "open") -> List[Dict]:
         """Fetch active markets from Kalshi"""
         try:
+            await self._ensure_auth()
             session = await self._get_session()
             url = f"{self.base_url}/trade-api/v2/markets"
             params = {"limit": limit, "status": status}
@@ -160,6 +173,7 @@ class KalshiClient:
     async def get_market(self, ticker: str) -> Optional[Dict]:
         """Fetch single market details"""
         try:
+            await self._ensure_auth()
             session = await self._get_session()
             url = f"{self.base_url}/trade-api/v2/markets/{ticker}"
 
@@ -175,6 +189,7 @@ class KalshiClient:
     async def get_orderbook(self, ticker: str) -> Optional[Dict]:
         """Fetch orderbook for a market"""
         try:
+            await self._ensure_auth()
             session = await self._get_session()
             url = f"{self.base_url}/trade-api/v2/markets/{ticker}/orderbook"
 
@@ -189,6 +204,7 @@ class KalshiClient:
     async def get_events(self, limit: int = 50, status: str = "open") -> List[Dict]:
         """Fetch events (groups of related markets)"""
         try:
+            await self._ensure_auth()
             session = await self._get_session()
             url = f"{self.base_url}/trade-api/v2/events"
             params = {"limit": limit, "status": status}
@@ -205,6 +221,7 @@ class KalshiClient:
     async def get_event_markets(self, event_ticker: str) -> List[Dict]:
         """Fetch all markets for a specific event (for NegRisk detection)"""
         try:
+            await self._ensure_auth()
             session = await self._get_session()
             url = f"{self.base_url}/trade-api/v2/markets"
             params = {"event_ticker": event_ticker, "limit": 100}
@@ -221,6 +238,7 @@ class KalshiClient:
     async def get_trades(self, ticker: str, limit: int = 100) -> List[Dict]:
         """Fetch recent trades for whale tracking"""
         try:
+            await self._ensure_auth()
             session = await self._get_session()
             url = f"{self.base_url}/trade-api/v2/markets/{ticker}/trades"
             params = {"limit": limit}
@@ -279,25 +297,61 @@ class CoinbaseClient:
             await self.session.close()
 
     def _sign_request(self, method: str, path: str, body: str = "") -> Dict[str, str]:
-        """Generate JWT signature for Coinbase API"""
+        """Generate auth headers for Coinbase Advanced Trade API.
+        Supports both legacy API keys (HMAC) and CDP API keys (JWT).
+        CDP keys contain 'organizations/' in the key name.
+        """
         if not self.api_key or not self.api_secret:
             return {}
 
         timestamp = str(int(time.time()))
-        message = f"{timestamp}{method.upper()}{path}{body}"
 
-        signature = hmac.new(
-            self.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest()
+        if "organizations/" in self.api_key:
+            # CDP API key — requires JWT
+            try:
+                import jwt as pyjwt
+            except ImportError:
+                # Fallback: generate a minimal JWT manually
+                header = base64.urlsafe_b64encode(
+                    json.dumps({"alg": "ES256", "kid": self.api_key, "typ": "JWT", "nonce": timestamp}).encode()
+                ).rstrip(b"=").decode()
+                uri = f"{method.upper()} {self.base_url.replace('https://', '')}{path}"
+                payload = base64.urlsafe_b64encode(
+                    json.dumps({"sub": self.api_key, "iss": "cdp", "aud": ["retail_rest_api_proxy"],
+                                "nbf": int(timestamp), "exp": int(timestamp) + 120, "uri": uri}).encode()
+                ).rstrip(b"=").decode()
+                logger.warning("PyJWT not installed — CDP key JWT signing requires 'pip install PyJWT cryptography'")
+                return {"Content-Type": "application/json"}
 
-        return {
-            "CB-ACCESS-KEY": self.api_key,
-            "CB-ACCESS-SIGN": signature,
-            "CB-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
-        }
+            uri = f"{method.upper()} {self.base_url.replace('https://', '')}{path}"
+            payload = {
+                "sub": self.api_key,
+                "iss": "cdp",
+                "aud": ["retail_rest_api_proxy"],
+                "nbf": int(timestamp),
+                "exp": int(timestamp) + 120,
+                "uri": uri,
+            }
+            token = pyjwt.encode(payload, self.api_secret, algorithm="ES256",
+                                 headers={"kid": self.api_key, "nonce": timestamp})
+            return {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+        else:
+            # Legacy API key — HMAC-SHA256
+            message = f"{timestamp}{method.upper()}{path}{body}"
+            signature = hmac.new(
+                self.api_secret.encode(),
+                message.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            return {
+                "CB-ACCESS-KEY": self.api_key,
+                "CB-ACCESS-SIGN": signature,
+                "CB-ACCESS-TIMESTAMP": timestamp,
+                "Content-Type": "application/json"
+            }
 
     async def get_accounts(self) -> List[Dict]:
         """Fetch wallet accounts/balances"""
@@ -413,7 +467,9 @@ class ArbitrageDetector:
                 return None
 
             # Calculate profit (buying both YES and NO should cost < $1 for arb)
-            profit_per_share = 1.0 - total_price
+            # Account for ~1% transaction fees on each side
+            total_price_with_fees = total_price * 1.01
+            profit_per_share = 1.0 - total_price_with_fees
 
             # Must exceed minimum threshold
             if profit_per_share < config.MIN_PROFIT_THRESHOLD:
@@ -481,18 +537,20 @@ class ArbitrageDetector:
                     prices.append({"ticker": m.get("ticker"), "price": yes_price})
 
             # Arbitrage exists if total probability ≠ 1.0
-            deviation = abs(1.0 - total_probability)
+            # Account for ~1% transaction fees
+            total_with_fees = total_probability * 1.01
+            deviation = abs(1.0 - total_with_fees)
 
             if deviation < config.MIN_PROFIT_THRESHOLD:
                 return None
 
-            # Calculate profit potential
-            if total_probability < 1.0:
+            # Calculate profit potential (after fees)
+            if total_with_fees < 1.0:
                 # Can buy all outcomes for < $1, guaranteed $1 payout
-                profit_per_share = 1.0 - total_probability
+                profit_per_share = 1.0 - total_with_fees
             else:
                 # Can sell all outcomes for > $1 (more complex execution)
-                profit_per_share = total_probability - 1.0
+                profit_per_share = total_with_fees - 1.0
 
             profit_dollars = profit_per_share * config.POSITION_SIZE
             roi_percent = (profit_per_share / total_probability) * 100 if total_probability > 0 else 0
@@ -744,6 +802,12 @@ class FastArbitrageBot:
         self.api_errors = 0
         self.last_api_call = None
 
+        # Activity log (last 100 entries for dashboard)
+        self.activity_log = deque(maxlen=100)
+
+        # Lock for thread-safe state reads (Flask runs in a separate thread)
+        self._state_lock = threading.Lock()
+
         # NegRisk / Multi-outcome tracking
         self.events = []  # Events with multiple outcomes
         self.negrisk_opportunities = []  # Detected NegRisk arbs
@@ -761,6 +825,11 @@ class FastArbitrageBot:
         """Logging with millisecond precision"""
         t = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"[{t}] {emoji} {msg}")
+        self.activity_log.append({
+            'time': t,
+            'emoji': emoji,
+            'msg': msg
+        })
 
     async def fetch_real_markets(self):
         """Fetch real markets from Kalshi API"""
@@ -969,17 +1038,35 @@ class FastArbitrageBot:
             orderbook = orderbooks.get(ticker)
 
             if orderbook:
-                # Extract prices from orderbook
-                ob_data = orderbook.get('orderbook', {})
-                yes_orders = ob_data.get('yes', [])
-                no_orders = ob_data.get('no', [])
+                try:
+                    # Extract prices from orderbook
+                    ob_data = orderbook.get('orderbook', {})
+                    yes_orders = ob_data.get('yes', [])
+                    no_orders = ob_data.get('no', [])
 
-                yes_price = yes_orders[0][0] / 100 if yes_orders else market.get('yes_price', 0.5)
-                no_price = no_orders[0][0] / 100 if no_orders else market.get('no_price', 0.5)
+                    yes_price = yes_orders[0][0] / 100 if yes_orders and len(yes_orders[0]) >= 1 else market.get('yes_price', 0.5)
+                    no_price = no_orders[0][0] / 100 if no_orders and len(no_orders[0]) >= 1 else market.get('no_price', 0.5)
+
+                    # Normalize orderbook format for ArbitrageDetector
+                    normalized_ob = {
+                        "yes": {
+                            "ask": yes_orders[0][0] if yes_orders and len(yes_orders[0]) >= 1 else 0,
+                            "bid": yes_orders[-1][0] if yes_orders and len(yes_orders[-1]) >= 1 else 0,
+                        },
+                        "no": {
+                            "ask": no_orders[0][0] if no_orders and len(no_orders[0]) >= 1 else 0,
+                            "bid": no_orders[-1][0] if no_orders and len(no_orders[-1]) >= 1 else 0,
+                        }
+                    }
+                except (IndexError, TypeError, KeyError) as e:
+                    logger.debug(f"Unexpected orderbook format for {ticker}: {e}")
+                    yes_price, no_price = self.get_prices(market)
+                    normalized_ob = None
             else:
                 yes_price, no_price = self.get_prices(market)
+                normalized_ob = None
 
-            self._process_market_check(market, yes_price, no_price)
+            self._process_market_check(market, yes_price, no_price, normalized_ob)
 
     def create_demo_markets(self):
         """Create local demo markets (fallback when no API)"""
@@ -1048,26 +1135,39 @@ class FastArbitrageBot:
         return yes, no
 
     async def get_prices_async(self, market) -> tuple:
-        """Get prices with real orderbook data when available"""
+        """Get prices with real orderbook data when available.
+        Returns (yes_price, no_price, normalized_orderbook_or_None).
+        """
         if self.mode == "LIVE":
             try:
                 orderbook = await self.kalshi_client.get_orderbook(market['id'])
                 if orderbook:
                     self.api_calls += 1
-                    # Extract best bid/ask
-                    yes_bids = orderbook.get('orderbook', {}).get('yes', [])
-                    no_bids = orderbook.get('orderbook', {}).get('no', [])
+                    ob_data = orderbook.get('orderbook', {})
+                    yes_orders = ob_data.get('yes', [])
+                    no_orders = ob_data.get('no', [])
 
-                    yes_price = yes_bids[0][0] / 100 if yes_bids else market.get('yes_price', 0.5)
-                    no_price = no_bids[0][0] / 100 if no_bids else market.get('no_price', 0.5)
+                    yes_price = yes_orders[0][0] / 100 if yes_orders else market.get('yes_price', 0.5)
+                    no_price = no_orders[0][0] / 100 if no_orders else market.get('no_price', 0.5)
 
-                    return yes_price, no_price
+                    normalized_ob = {
+                        "yes": {
+                            "ask": yes_orders[0][0] if yes_orders else 0,
+                            "bid": yes_orders[-1][0] if yes_orders else 0,
+                        },
+                        "no": {
+                            "ask": no_orders[0][0] if no_orders else 0,
+                            "bid": no_orders[-1][0] if no_orders else 0,
+                        }
+                    }
+                    return yes_price, no_price, normalized_ob
             except Exception as e:
                 self.api_errors += 1
                 logger.debug(f"Orderbook fetch failed for {market['id']}: {e}")
 
         # Fallback to market prices or simulation
-        return self.get_prices(market)
+        yes, no = self.get_prices(market)
+        return yes, no, None
 
     def execute_trade(self, market, yes, no, profit, opportunity: Optional[ArbitrageOpportunity] = None):
         """Execute arbitrage trade (demo) or log opportunity (live)"""
@@ -1133,10 +1233,10 @@ class FastArbitrageBot:
 
     async def check_market_async(self, market):
         """Check single market for arbitrage (async version for live API)"""
-        yes, no = await self.get_prices_async(market)
-        self._process_market_check(market, yes, no)
+        yes, no, orderbook = await self.get_prices_async(market)
+        self._process_market_check(market, yes, no, orderbook)
 
-    def _process_market_check(self, market, yes, no):
+    def _process_market_check(self, market, yes, no, orderbook=None):
         """Process market check and detect arbitrage"""
         # Track timing for checks/sec calculation
         now_ns = time.perf_counter_ns()
@@ -1164,7 +1264,7 @@ class FastArbitrageBot:
         if self.mode == "LIVE" and config.ENABLE_SINGLE_CONDITION:
             opportunity = self.detector.detect_single_condition(
                 market.get('raw', market),
-                None  # Could pass orderbook here
+                orderbook
             )
 
         # Determine if this is an arbitrage opportunity
@@ -1173,21 +1273,22 @@ class FastArbitrageBot:
             is_arb = True
             profit = opportunity.profit_per_share
 
-        # Update dashboard data
-        self.market_prices[market['id']] = {
-            'id': market['id'],
-            'type': market['type'],
-            'question': market['question'],
-            'yes': yes,
-            'no': no,
-            'total': total,
-            'total_with_fees': total_with_fees,
-            'is_arb': is_arb,
-            'profit': max(0, profit),
-            'roi': opportunity.roi_percent if opportunity else (profit / total * 100 if total > 0 else 0),
-            'urgency': opportunity.urgency if opportunity else 'low',
-            'history': list(self.price_history.get(market['id'], []))
-        }
+        # Update dashboard data (lock for thread-safe Flask reads)
+        with self._state_lock:
+            self.market_prices[market['id']] = {
+                'id': market['id'],
+                'type': market['type'],
+                'question': market['question'],
+                'yes': yes,
+                'no': no,
+                'total': total,
+                'total_with_fees': total_with_fees,
+                'is_arb': is_arb,
+                'profit': max(0, profit),
+                'roi': opportunity.roi_percent if opportunity else (profit / total * 100 if total > 0 else 0),
+                'urgency': opportunity.urgency if opportunity else 'low',
+                'history': list(self.price_history.get(market['id'], []))
+            }
 
         # Execute if arbitrage opportunity (don't duplicate if detector found it)
         if is_arb:
@@ -1309,7 +1410,11 @@ class FastArbitrageBot:
             self.last_report = time.time()
 
     def get_state(self):
-        """Get current state for dashboard"""
+        """Get current state for dashboard (called from Flask thread)"""
+        with self._state_lock:
+            markets_snapshot = list(self.market_prices.values())
+            trades_snapshot = self.trades[-50:]
+            log_snapshot = list(self.activity_log)[-50:]
         cycle_times_list = list(self.cycle_times)
         avg_cycle = sum(cycle_times_list) / len(cycle_times_list) if cycle_times_list else 0
         min_cycle = min(cycle_times_list) if cycle_times_list else 0
@@ -1353,8 +1458,8 @@ class FastArbitrageBot:
 
         return {
             'mode': self.mode,
-            'markets': list(self.market_prices.values()),
-            'trades': self.trades[-50:],
+            'markets': markets_snapshot,
+            'trades': trades_snapshot,
             'total_pnl': self.total_pnl,
             'total_trades': len(self.trades),
             'is_running': self.is_running,
@@ -1378,12 +1483,13 @@ class FastArbitrageBot:
                 'api_errors': self.api_errors,
                 'negrisk_count': len(self.negrisk_opportunities),
                 'whale_signals_count': len(self.whale_signals)
-            }
+            },
+            'activity_log': log_snapshot
         }
 
     def set_speed(self, ms):
         """Set polling speed"""
-        self.poll_interval_ms = max(10, min(200, ms))
+        self.poll_interval_ms = max(10, min(2000, ms))
         self.log(f"Polling speed set to {self.poll_interval_ms}ms", "⚙️")
 
     def toggle_pause(self):
@@ -1668,6 +1774,39 @@ DASHBOARD_HTML = """
         .best-trade-profit { font-size: 1.5em; color: #ffd700; font-weight: bold; }
         .best-trade-details { font-size: 0.75em; opacity: 0.7; margin-top: 4px; }
 
+        /* Activity Log */
+        .activity-log-container {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            overflow: hidden;
+            margin-top: 20px;
+        }
+        .activity-log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            background: rgba(0,0,0,0.3);
+        }
+        .activity-log-header h3 { font-size: 0.85em; color: #00d4ff; }
+        .activity-log {
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.75em;
+        }
+        .log-entry {
+            padding: 3px 8px;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            display: flex;
+            gap: 8px;
+            line-height: 1.5;
+        }
+        .log-entry:hover { background: rgba(255,255,255,0.03); }
+        .log-time { color: #666; white-space: nowrap; }
+        .log-msg { color: #ccc; word-break: break-word; }
+
         /* Trades */
         .trades-container {
             background: rgba(0,0,0,0.3);
@@ -1769,7 +1908,7 @@ DASHBOARD_HTML = """
             <div class="controls">
                 <div class="speed-control">
                     <span class="speed-label">Speed:</span>
-                    <input type="range" id="speedSlider" min="10" max="100" value="30">
+                    <input type="range" id="speedSlider" min="10" max="2000" value="1000">
                     <span class="speed-value" id="speedValue">30ms</span>
                 </div>
                 <button class="btn" id="pauseBtn" onclick="togglePause()">⏸️ Pause</button>
@@ -1844,6 +1983,15 @@ DASHBOARD_HTML = """
             </div>
             <div class="trades" id="trades">
                 <div class="no-data">Waiting for arbitrage...</div>
+            </div>
+        </div>
+
+        <div class="activity-log-container">
+            <div class="activity-log-header">
+                <h3>Activity Log</h3>
+            </div>
+            <div class="activity-log" id="activityLog">
+                <div class="no-data">Waiting for activity...</div>
             </div>
         </div>
     </div>
@@ -2047,6 +2195,14 @@ DASHBOARD_HTML = """
                     }
                 }
 
+                // Activity Log
+                const logDiv = document.getElementById('activityLog');
+                if (data.activity_log && data.activity_log.length > 0) {
+                    logDiv.innerHTML = data.activity_log.slice().reverse().map(entry =>
+                        `<div class="log-entry"><span class="log-time">[${entry.time}]</span><span class="log-msg">${entry.emoji} ${entry.msg}</span></div>`
+                    ).join('');
+                }
+
                 isPaused = data.is_paused;
                 const pauseBtn = document.getElementById('pauseBtn');
                 pauseBtn.textContent = isPaused ? '▶️ Resume' : '⏸️ Pause';
@@ -2124,26 +2280,26 @@ def main():
     mode = "LIVE (Kalshi API)" if config.KALSHI_API_KEY and not config.DEMO_MODE else "DEMO (Simulated)"
 
     print(f"""
-╔════════════════════════════════════════════════════════════════╗
-║                                                                ║
-║   ⚡ KALSHI + COINBASE ARBITRAGE BOT ⚡                        ║
-║                                                                ║
-║   Based on IMDEA Networks research ($39.59M extraction)        ║
-║                                                                ║
-║   Mode: {mode:<52} ║
-║                                                                ║
-║   Strategies:                                                  ║
-║   • Single-Condition: YES + NO ≠ $1.00                         ║
-║   • Multi-Outcome: Sum of probabilities ≠ 100%                 ║
-║                                                                ║
-║   Environment Variables:                                       ║
-║   • KALSHI_API_KEY     - Kalshi email/API key                  ║
-║   • KALSHI_PRIVATE_KEY - Kalshi password/private key           ║
-║   • COINBASE_API_KEY   - Coinbase CDP API key                  ║
-║   • COINBASE_API_SECRET- Coinbase API secret                   ║
-║   • DEMO_MODE=false    - Enable live trading                   ║
-║                                                                ║
-╚════════════════════════════════════════════════════════════════╝
++----------------------------------------------------------------+
+|                                                                |
+|   KALSHI + COINBASE ARBITRAGE BOT                              |
+|                                                                |
+|   Based on IMDEA Networks research ($39.59M extraction)        |
+|                                                                |
+|   Mode: {mode:<53} |
+|                                                                |
+|   Strategies:                                                  |
+|   - Single-Condition: YES + NO != $1.00                        |
+|   - Multi-Outcome: Sum of probabilities != 100%                |
+|                                                                |
+|   Environment Variables:                                       |
+|   - KALSHI_API_KEY      - Kalshi email/API key                 |
+|   - KALSHI_PRIVATE_KEY  - Kalshi password/private key          |
+|   - COINBASE_API_KEY    - Coinbase CDP API key                 |
+|   - COINBASE_API_SECRET - Coinbase API secret                  |
+|   - DEMO_MODE=false     - Enable live trading                  |
+|                                                                |
++----------------------------------------------------------------+
 """)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
